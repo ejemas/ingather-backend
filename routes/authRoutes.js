@@ -35,6 +35,5 @@ router.get('/me', auth, authController.getCurrentChurch);
 
 // Update church info (protected)
 router.put('/update', auth, authController.updateChurch);
-// Update church info (protected)
-router.put('/update', auth, authController.updateChurch);
+
 module.exports = router;
