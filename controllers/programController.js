@@ -264,3 +264,43 @@ exports.getAttendanceOverTime = async (req, res) => {
     res.status(500).json({ error: 'Server error fetching attendance data' });
   }
 };
+
+// Get count-only statistics
+exports.getCountOnlyStats = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const churchId = req.churchId;
+
+    // Verify program belongs to church
+    const programCheck = await pool.query(
+      'SELECT id, tracking_mode FROM programs WHERE id = $1 AND church_id = $2',
+      [id, churchId]
+    );
+
+    if (programCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Program not found' });
+    }
+
+    // Get gender breakdown
+    const genderStats = await pool.query(
+      `SELECT 
+        COUNT(CASE WHEN gender = 'male' THEN 1 END) as male_count,
+        COUNT(CASE WHEN gender = 'female' THEN 1 END) as female_count,
+        COUNT(CASE WHEN first_timer = true THEN 1 END) as first_timer_count
+       FROM scans 
+       WHERE program_id = $1`,
+      [id]
+    );
+
+    res.json({
+      stats: {
+        maleCount: parseInt(genderStats.rows[0].male_count),
+        femaleCount: parseInt(genderStats.rows[0].female_count),
+        firstTimerCount: parseInt(genderStats.rows[0].first_timer_count)
+      }
+    });
+  } catch (error) {
+    console.error('Get count-only stats error:', error);
+    res.status(500).json({ error: 'Server error fetching statistics' });
+  }
+};

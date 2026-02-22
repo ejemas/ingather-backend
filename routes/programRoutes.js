@@ -23,6 +23,9 @@ router.post(
 // Get all programs (protected)
 router.get('/', auth, programController.getPrograms);
 
+// Get all programs (protected)
+router.get('/', auth, programController.getPrograms);
+
 // Get single program (protected)
 router.get('/:id', auth, programController.getProgramById);
 
@@ -35,4 +38,6 @@ router.get('/:id/attendees', auth, programController.getAttendees);
 // Get attendance over time (protected)
 router.get('/:id/attendance-data', auth, programController.getAttendanceOverTime);
 
+// Get count-only statistics (protected)
+router.get('/:id/count-stats', auth, programController.getCountOnlyStats);
 module.exports = router;

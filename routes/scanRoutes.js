@@ -11,4 +11,7 @@ router.post('/program/:programId', scanController.scanQR);
 // Submit form data only (public)
 router.post('/program/:programId/form', scanController.submitFormData);
 
+// Update scan data (public)
+router.put('/program/:programId/update-scan', scanController.updateScanData);
+
 module.exports = router;

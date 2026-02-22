@@ -46,10 +46,11 @@ exports.scanQR = async (req, res) => {
     }
 
     // Insert scan record (NEW SCAN)
-    await client.query(
-      'INSERT INTO scans (program_id, device_fingerprint) VALUES ($1, $2)',
-      [programId, deviceFingerprint]
-    );
+    // Insert scan record (with optional gender and first_timer data)
+await client.query(
+  'INSERT INTO scans (program_id, device_fingerprint, gender, first_timer) VALUES ($1, $2, $3, $4)',
+  [programId, deviceFingerprint, req.body.gender || null, req.body.firstTimer || false]
+);
 
     // Increment total scans
     await client.query(
@@ -75,12 +76,15 @@ exports.scanQR = async (req, res) => {
     });
 
     // Return success with tracking mode info
-    res.json({
-      success: true,
-      trackingMode: program.tracking_mode,
-      totalScans: totalScans,
-      firstScan: true // Important: tells frontend this is a new scan
-    });
+    // Return success with tracking mode info
+// Return success with tracking mode info
+res.json({
+  success: true,
+  trackingMode: program.tracking_mode,
+  totalScans: totalScans,
+  firstScan: true,
+  isFirstTimer: req.body.firstTimer || false
+});
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Scan error:', error);
@@ -238,5 +242,34 @@ exports.submitFormData = async (req, res) => {
     res.status(500).json({ error: 'Server error submitting form' });
   } finally {
     client.release();
+  }
+};
+
+// Update existing scan with gender and first-timer data
+exports.updateScanData = async (req, res) => {
+  try {
+    const { programId } = req.params;
+    const { deviceFingerprint, gender, firstTimer } = req.body;
+
+    // Update the scan record
+    const result = await pool.query(
+      `UPDATE scans 
+       SET gender = $1, first_timer = $2 
+       WHERE program_id = $3 AND device_fingerprint = $4
+       RETURNING *`,
+      [gender, firstTimer, programId, deviceFingerprint]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Scan not found' });
+    }
+
+    res.json({ 
+      success: true, 
+      message: 'Scan data updated successfully' 
+    });
+  } catch (error) {
+    console.error('Update scan error:', error);
+    res.status(500).json({ error: 'Server error updating scan data' });
   }
 };
