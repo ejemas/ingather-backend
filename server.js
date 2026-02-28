@@ -1,3 +1,7 @@
+// Force IPv4 DNS resolution — Render cannot reach Gmail SMTP over IPv6
+const dns = require('dns');
+dns.setDefaultResultOrder('ipv4first');
+
 const express = require('express');
 const cors = require('cors');
 const http = require('http');
@@ -46,13 +50,13 @@ app.use('/api/scan', scanRoutes);
 // Socket.io connection
 io.on('connection', (socket) => {
   console.log('✅ New client connected:', socket.id);
-  
+
   // Join program room for real-time updates
   socket.on('join-program', (programId) => {
     socket.join(`program-${programId}`);
     console.log(`Client ${socket.id} joined program ${programId}`);
   });
-  
+
   socket.on('disconnect', () => {
     console.log('❌ Client disconnected:', socket.id);
   });
