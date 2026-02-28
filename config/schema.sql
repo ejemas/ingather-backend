@@ -7,6 +7,9 @@ CREATE TABLE IF NOT EXISTS churches (
     password VARCHAR(255) NOT NULL,
     location VARCHAR(255) NOT NULL,
     logo_url VARCHAR(500),
+    is_verified BOOLEAN DEFAULT FALSE,
+    otp_code VARCHAR(10),
+    otp_expires_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
