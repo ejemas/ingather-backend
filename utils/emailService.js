@@ -1,56 +1,8 @@
-const nodemailer = require('nodemailer');
-const dns = require('dns');
-const { promisify } = require('util');
-const resolve4 = promisify(dns.resolve4);
+const { Resend } = require('resend');
 
-let transporter = null;
+const resend = new Resend(process.env.RESEND_API_KEY);
 
-/**
- * Create the email transporter by manually resolving Gmail's IPv4 address.
- * This bypasses Render's IPv6-only DNS resolution which is unreachable.
- */
-async function getTransporter() {
-  if (transporter) return transporter;
-
-  let host = 'smtp.gmail.com';
-
-  try {
-    // Manually resolve to IPv4 — bypasses Render's IPv6 DNS
-    const addresses = await resolve4('smtp.gmail.com');
-    if (addresses && addresses.length > 0) {
-      host = addresses[0];
-      console.log(`📧 Resolved smtp.gmail.com to IPv4: ${host}`);
-    }
-  } catch (err) {
-    console.log('⚠️ IPv4 DNS resolve failed, using hostname as fallback');
-  }
-
-  transporter = nodemailer.createTransport({
-    host: host,
-    port: 587,
-    secure: false,
-    auth: {
-      user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASS
-    },
-    tls: {
-      // Must set servername for TLS certificate validation when using IP
-      servername: 'smtp.gmail.com',
-      rejectUnauthorized: false
-    },
-    connectionTimeout: 15000,
-    greetingTimeout: 15000,
-    socketTimeout: 20000
-  });
-
-  return transporter;
-}
-
-// Initialize on startup
-getTransporter()
-  .then(t => t.verify())
-  .then(() => console.log('✅ Email service ready'))
-  .catch((err) => console.error('❌ Email service error:', err.message));
+console.log('✅ Email service ready (Resend HTTP API)');
 
 /**
  * Generate a random 4-digit OTP
@@ -63,9 +15,8 @@ const generateOTP = () => {
  * Send OTP email for account verification
  */
 const sendOTPEmail = async (email, otp) => {
-  const t = await getTransporter();
-  const mailOptions = {
-    from: `"Ingather" <${process.env.EMAIL_USER}>`,
+  const { error } = await resend.emails.send({
+    from: `Ingather <${process.env.EMAIL_FROM || 'onboarding@resend.dev'}>`,
     to: email,
     subject: 'Verify Your Ingather Account',
     html: `
@@ -90,18 +41,20 @@ const sendOTPEmail = async (email, otp) => {
         </div>
       </div>
     `
-  };
+  });
 
-  await t.sendMail(mailOptions);
+  if (error) {
+    console.error('Email send error:', error);
+    throw new Error(error.message || 'Failed to send email');
+  }
 };
 
 /**
  * Send OTP email for password reset
  */
 const sendPasswordResetEmail = async (email, otp) => {
-  const t = await getTransporter();
-  const mailOptions = {
-    from: `"Ingather" <${process.env.EMAIL_USER}>`,
+  const { error } = await resend.emails.send({
+    from: `Ingather <${process.env.EMAIL_FROM || 'onboarding@resend.dev'}>`,
     to: email,
     subject: 'Reset Your Ingather Password',
     html: `
@@ -126,9 +79,12 @@ const sendPasswordResetEmail = async (email, otp) => {
         </div>
       </div>
     `
-  };
+  });
 
-  await t.sendMail(mailOptions);
+  if (error) {
+    console.error('Email send error:', error);
+    throw new Error(error.message || 'Failed to send email');
+  }
 };
 
 module.exports = { generateOTP, sendOTPEmail, sendPasswordResetEmail };
