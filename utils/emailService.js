@@ -1,35 +1,40 @@
 const nodemailer = require('nodemailer');
 
-// Configure Gmail SMTP transporter
+// Configure Gmail SMTP transporter (port 587 + STARTTLS for Render compatibility)
 const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS
-    }
+  host: 'smtp.gmail.com',
+  port: 587,
+  secure: false,
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS
+  },
+  tls: {
+    rejectUnauthorized: false
+  }
 });
 
 // Verify transporter connection on startup
 transporter.verify()
-    .then(() => console.log('✅ Email service ready'))
-    .catch((err) => console.error('❌ Email service error:', err.message));
+  .then(() => console.log('✅ Email service ready'))
+  .catch((err) => console.error('❌ Email service error:', err.message));
 
 /**
  * Generate a random 4-digit OTP
  */
 const generateOTP = () => {
-    return Math.floor(1000 + Math.random() * 9000).toString();
+  return Math.floor(1000 + Math.random() * 9000).toString();
 };
 
 /**
  * Send OTP email for account verification
  */
 const sendOTPEmail = async (email, otp) => {
-    const mailOptions = {
-        from: `"Ingather" <${process.env.EMAIL_USER}>`,
-        to: email,
-        subject: 'Verify Your Ingather Account',
-        html: `
+  const mailOptions = {
+    from: `"Ingather" <${process.env.EMAIL_USER}>`,
+    to: email,
+    subject: 'Verify Your Ingather Account',
+    html: `
       <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 500px; margin: 0 auto; background-color: #090809; border-radius: 16px; overflow: hidden;">
         <div style="background: linear-gradient(135deg, #F96D10 0%, #e05d00 100%); padding: 32px; text-align: center;">
           <h1 style="color: #EBEBD3; margin: 0; font-size: 28px;">Ingather</h1>
@@ -51,20 +56,20 @@ const sendOTPEmail = async (email, otp) => {
         </div>
       </div>
     `
-    };
+  };
 
-    await transporter.sendMail(mailOptions);
+  await transporter.sendMail(mailOptions);
 };
 
 /**
  * Send OTP email for password reset
  */
 const sendPasswordResetEmail = async (email, otp) => {
-    const mailOptions = {
-        from: `"Ingather" <${process.env.EMAIL_USER}>`,
-        to: email,
-        subject: 'Reset Your Ingather Password',
-        html: `
+  const mailOptions = {
+    from: `"Ingather" <${process.env.EMAIL_USER}>`,
+    to: email,
+    subject: 'Reset Your Ingather Password',
+    html: `
       <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 500px; margin: 0 auto; background-color: #090809; border-radius: 16px; overflow: hidden;">
         <div style="background: linear-gradient(135deg, #F96D10 0%, #e05d00 100%); padding: 32px; text-align: center;">
           <h1 style="color: #EBEBD3; margin: 0; font-size: 28px;">Ingather</h1>
@@ -86,9 +91,9 @@ const sendPasswordResetEmail = async (email, otp) => {
         </div>
       </div>
     `
-    };
+  };
 
-    await transporter.sendMail(mailOptions);
+  await transporter.sendMail(mailOptions);
 };
 
 module.exports = { generateOTP, sendOTPEmail, sendPasswordResetEmail };
