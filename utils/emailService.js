@@ -1,6 +1,6 @@
 const nodemailer = require('nodemailer');
 
-// Configure Gmail SMTP transporter (port 587 + STARTTLS for Render compatibility)
+// Configure Gmail SMTP transporter (port 587 + STARTTLS, forced IPv4 for Render)
 const transporter = nodemailer.createTransport({
   host: 'smtp.gmail.com',
   port: 587,
@@ -11,7 +11,12 @@ const transporter = nodemailer.createTransport({
   },
   tls: {
     rejectUnauthorized: false
-  }
+  },
+  // Force IPv4 — Render cannot reach Gmail over IPv6
+  family: 4,
+  connectionTimeout: 10000,
+  greetingTimeout: 10000,
+  socketTimeout: 15000
 });
 
 // Verify transporter connection on startup
