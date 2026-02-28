@@ -1,8 +1,13 @@
 const { Resend } = require('resend');
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+let resend = null;
 
-console.log('✅ Email service ready (Resend HTTP API)');
+if (process.env.RESEND_API_KEY) {
+  resend = new Resend(process.env.RESEND_API_KEY);
+  console.log('✅ Email service ready (Resend HTTP API)');
+} else {
+  console.warn('⚠️ RESEND_API_KEY not set — email sending will fail. Add it to your environment variables.');
+}
 
 /**
  * Generate a random 4-digit OTP
