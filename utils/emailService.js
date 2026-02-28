@@ -1,26 +1,54 @@
 const nodemailer = require('nodemailer');
+const dns = require('dns');
+const { promisify } = require('util');
+const resolve4 = promisify(dns.resolve4);
 
-// Configure Gmail SMTP transporter (port 587 + STARTTLS, forced IPv4 for Render)
-const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 587,
-  secure: false,
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS
-  },
-  tls: {
-    rejectUnauthorized: false
-  },
-  // Force IPv4 — Render cannot reach Gmail over IPv6
-  family: 4,
-  connectionTimeout: 10000,
-  greetingTimeout: 10000,
-  socketTimeout: 15000
-});
+let transporter = null;
 
-// Verify transporter connection on startup
-transporter.verify()
+/**
+ * Create the email transporter by manually resolving Gmail's IPv4 address.
+ * This bypasses Render's IPv6-only DNS resolution which is unreachable.
+ */
+async function getTransporter() {
+  if (transporter) return transporter;
+
+  let host = 'smtp.gmail.com';
+
+  try {
+    // Manually resolve to IPv4 — bypasses Render's IPv6 DNS
+    const addresses = await resolve4('smtp.gmail.com');
+    if (addresses && addresses.length > 0) {
+      host = addresses[0];
+      console.log(`📧 Resolved smtp.gmail.com to IPv4: ${host}`);
+    }
+  } catch (err) {
+    console.log('⚠️ IPv4 DNS resolve failed, using hostname as fallback');
+  }
+
+  transporter = nodemailer.createTransport({
+    host: host,
+    port: 587,
+    secure: false,
+    auth: {
+      user: process.env.EMAIL_USER,
+      pass: process.env.EMAIL_PASS
+    },
+    tls: {
+      // Must set servername for TLS certificate validation when using IP
+      servername: 'smtp.gmail.com',
+      rejectUnauthorized: false
+    },
+    connectionTimeout: 15000,
+    greetingTimeout: 15000,
+    socketTimeout: 20000
+  });
+
+  return transporter;
+}
+
+// Initialize on startup
+getTransporter()
+  .then(t => t.verify())
   .then(() => console.log('✅ Email service ready'))
   .catch((err) => console.error('❌ Email service error:', err.message));
 
@@ -35,6 +63,7 @@ const generateOTP = () => {
  * Send OTP email for account verification
  */
 const sendOTPEmail = async (email, otp) => {
+  const t = await getTransporter();
   const mailOptions = {
     from: `"Ingather" <${process.env.EMAIL_USER}>`,
     to: email,
@@ -63,13 +92,14 @@ const sendOTPEmail = async (email, otp) => {
     `
   };
 
-  await transporter.sendMail(mailOptions);
+  await t.sendMail(mailOptions);
 };
 
 /**
  * Send OTP email for password reset
  */
 const sendPasswordResetEmail = async (email, otp) => {
+  const t = await getTransporter();
   const mailOptions = {
     from: `"Ingather" <${process.env.EMAIL_USER}>`,
     to: email,
@@ -98,7 +128,7 @@ const sendPasswordResetEmail = async (email, otp) => {
     `
   };
 
-  await transporter.sendMail(mailOptions);
+  await t.sendMail(mailOptions);
 };
 
 module.exports = { generateOTP, sendOTPEmail, sendPasswordResetEmail };
