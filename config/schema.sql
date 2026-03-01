@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS scans (
     id SERIAL PRIMARY KEY,
     program_id INTEGER REFERENCES programs(id) ON DELETE CASCADE,
     device_fingerprint VARCHAR(500) NOT NULL,
+    gender VARCHAR(20),
+    first_timer BOOLEAN DEFAULT FALSE,
     scan_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(program_id, device_fingerprint)
 );

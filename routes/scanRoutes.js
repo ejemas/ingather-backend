@@ -14,4 +14,7 @@ router.post('/program/:programId/form', scanController.submitFormData);
 // Update scan data (public)
 router.put('/program/:programId/update-scan', scanController.updateScanData);
 
+// Get scan records for a program (authenticated)
+router.get('/program/:programId/scans', scanController.getScansForProgram);
+
 module.exports = router;

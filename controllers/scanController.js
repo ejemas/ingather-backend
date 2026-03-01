@@ -6,7 +6,7 @@ const pool = require('../config/database');
 // Handle QR scan
 exports.scanQR = async (req, res) => {
   const client = await pool.connect();
-  
+
   try {
     const { programId } = req.params;
     const { deviceFingerprint, formData } = req.body;
@@ -39,18 +39,18 @@ exports.scanQR = async (req, res) => {
 
     if (scanCheck.rows.length > 0) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'This device has already scanned this program',
-        alreadyScanned: true 
+        alreadyScanned: true
       });
     }
 
     // Insert scan record (NEW SCAN)
     // Insert scan record (with optional gender and first_timer data)
-await client.query(
-  'INSERT INTO scans (program_id, device_fingerprint, gender, first_timer) VALUES ($1, $2, $3, $4)',
-  [programId, deviceFingerprint, req.body.gender || null, req.body.firstTimer || false]
-);
+    await client.query(
+      'INSERT INTO scans (program_id, device_fingerprint, gender, first_timer) VALUES ($1, $2, $3, $4)',
+      [programId, deviceFingerprint, req.body.gender || null, req.body.firstTimer || false]
+    );
 
     // Increment total scans
     await client.query(
@@ -68,31 +68,44 @@ await client.query(
 
     const totalScans = updatedProgram.rows[0].total_scans;
 
+    // Get gender/first-timer breakdown for real-time stats
+    const statsResult = await pool.query(
+      `SELECT 
+        COUNT(CASE WHEN gender = 'male' THEN 1 END) as male_count,
+        COUNT(CASE WHEN gender = 'female' THEN 1 END) as female_count,
+        COUNT(CASE WHEN first_timer = true THEN 1 END) as first_timer_count
+       FROM scans WHERE program_id = $1`,
+      [programId]
+    );
+
     // Emit real-time update via Socket.io
     const io = req.app.get('io');
     io.emit(`program-${programId}-update`, {
       totalScans: totalScans,
+      maleCount: parseInt(statsResult.rows[0].male_count),
+      femaleCount: parseInt(statsResult.rows[0].female_count),
+      firstTimerCount: parseInt(statsResult.rows[0].first_timer_count),
       timestamp: new Date()
     });
 
     // Return success with tracking mode info
     // Return success with tracking mode info
-// Return success with tracking mode info
-res.json({
-  success: true,
-  trackingMode: program.tracking_mode,
-  totalScans: totalScans,
-  firstScan: true,
-  isFirstTimer: req.body.firstTimer || false
-});
+    // Return success with tracking mode info
+    res.json({
+      success: true,
+      trackingMode: program.tracking_mode,
+      totalScans: totalScans,
+      firstScan: true,
+      isFirstTimer: req.body.firstTimer || false
+    });
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Scan error:', error);
-    
+
     if (error.code === '23505') { // Unique constraint violation
-      res.status(400).json({ 
+      res.status(400).json({
         error: 'This device has already scanned this program',
-        alreadyScanned: true 
+        alreadyScanned: true
       });
     } else {
       res.status(500).json({ error: 'Server error processing scan' });
@@ -147,7 +160,7 @@ exports.getProgramInfo = async (req, res) => {
 // Submit form data only (scan already recorded)
 exports.submitFormData = async (req, res) => {
   const client = await pool.connect();
-  
+
   try {
     const { programId } = req.params;
     const { deviceFingerprint, formData } = req.body;
@@ -200,7 +213,7 @@ exports.submitFormData = async (req, res) => {
     if (program.gifting_enabled && program.winners_selected < program.total_winners) {
       // Random selection
       isWinner = Math.random() > 0.5;
-      
+
       if (isWinner) {
         await client.query(
           'UPDATE programs SET winners_selected = winners_selected + 1 WHERE id = $1',
@@ -230,6 +243,26 @@ exports.submitFormData = async (req, res) => {
     );
 
     await client.query('COMMIT');
+
+    // Emit real-time update with attendee stats for collect-data mode
+    const attendeeStats = await pool.query(
+      `SELECT 
+        COUNT(*) as total,
+        COUNT(CASE WHEN sex = 'Male' THEN 1 END) as male_count,
+        COUNT(CASE WHEN sex = 'Female' THEN 1 END) as female_count,
+        COUNT(CASE WHEN first_timer = true THEN 1 END) as first_timer_count
+       FROM attendees WHERE program_id = $1`,
+      [programId]
+    );
+
+    const io = req.app.get('io');
+    io.emit(`program-${programId}-update`, {
+      attendeeMaleCount: parseInt(attendeeStats.rows[0].male_count),
+      attendeeFemaleCount: parseInt(attendeeStats.rows[0].female_count),
+      attendeeFirstTimerCount: parseInt(attendeeStats.rows[0].first_timer_count),
+      attendeeTotal: parseInt(attendeeStats.rows[0].total),
+      timestamp: new Date()
+    });
 
     res.json({
       success: true,
@@ -264,12 +297,57 @@ exports.updateScanData = async (req, res) => {
       return res.status(404).json({ error: 'Scan not found' });
     }
 
-    res.json({ 
-      success: true, 
-      message: 'Scan data updated successfully' 
+    // Get updated stats and emit real-time update
+    const statsResult = await pool.query(
+      `SELECT 
+        COUNT(CASE WHEN gender = 'male' THEN 1 END) as male_count,
+        COUNT(CASE WHEN gender = 'female' THEN 1 END) as female_count,
+        COUNT(CASE WHEN first_timer = true THEN 1 END) as first_timer_count
+       FROM scans WHERE program_id = $1`,
+      [programId]
+    );
+
+    const io = req.app.get('io');
+    io.emit(`program-${programId}-update`, {
+      maleCount: parseInt(statsResult.rows[0].male_count),
+      femaleCount: parseInt(statsResult.rows[0].female_count),
+      firstTimerCount: parseInt(statsResult.rows[0].first_timer_count),
+      timestamp: new Date()
+    });
+
+    res.json({
+      success: true,
+      message: 'Scan data updated successfully'
     });
   } catch (error) {
     console.error('Update scan error:', error);
     res.status(500).json({ error: 'Server error updating scan data' });
+  }
+};
+
+// Get scan records for a program (for count-only table)
+exports.getScansForProgram = async (req, res) => {
+  try {
+    const { programId } = req.params;
+
+    const result = await pool.query(
+      `SELECT id, gender, first_timer, scan_time 
+       FROM scans 
+       WHERE program_id = $1 
+       ORDER BY scan_time DESC`,
+      [programId]
+    );
+
+    res.json({
+      scans: result.rows.map(scan => ({
+        id: scan.id,
+        gender: scan.gender,
+        firstTimer: scan.first_timer,
+        scanTime: scan.scan_time
+      }))
+    });
+  } catch (error) {
+    console.error('Get scans error:', error);
+    res.status(500).json({ error: 'Server error fetching scans' });
   }
 };
