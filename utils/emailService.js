@@ -21,7 +21,7 @@ const generateOTP = () => {
  */
 const sendOTPEmail = async (email, otp) => {
   const { error } = await resend.emails.send({
-    from: `Ingather <${process.env.EMAIL_FROM || 'Ingather <no-reply@ingather.app>'}>`,
+    from: `Ingather <${process.env.EMAIL_FROM || 'no-reply@ingather.app'}>`,
     to: email,
     subject: 'Verify Your Ingather Account',
     html: `
@@ -59,7 +59,7 @@ const sendOTPEmail = async (email, otp) => {
  */
 const sendPasswordResetEmail = async (email, otp) => {
   const { error } = await resend.emails.send({
-    from: `Ingather <${process.env.EMAIL_FROM || 'Ingather <no-reply@ingather.app>'}>`,
+    from: `Ingather <${process.env.EMAIL_FROM || 'no-reply@ingather.app'}>`,
     to: email,
     subject: 'Reset Your Ingather Password',
     html: `
