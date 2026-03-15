@@ -4,15 +4,15 @@ const QRCode = require('qrcode');
 // Create Program
 exports.createProgram = async (req, res) => {
   try {
-    const { 
-      programTitle, 
-      date, 
-      startTime, 
-      endTime, 
-      trackingMode, 
-      dataFields, 
-      enableGifting, 
-      numberOfWinners 
+    const {
+      programTitle,
+      date,
+      startTime,
+      endTime,
+      trackingMode,
+      dataFields,
+      enableGifting,
+      numberOfWinners
     } = req.body;
 
     const churchId = req.churchId;
@@ -137,6 +137,12 @@ exports.getProgramById = async (req, res) => {
       [id]
     );
 
+    // Get winners gifted count
+    const winnersGiftedResult = await pool.query(
+      'SELECT COUNT(*) FROM attendees WHERE program_id = $1 AND is_winner = true AND is_gifted = true',
+      [id]
+    );
+
     res.json({
       id: program.id,
       title: program.title,
@@ -148,6 +154,7 @@ exports.getProgramById = async (req, res) => {
       giftingEnabled: program.gifting_enabled,
       totalWinners: program.total_winners,
       winnersSelected: program.winners_selected,
+      winnersGifted: parseInt(winnersGiftedResult.rows[0].count),
       qrCodeUrl: program.qr_code_url,
       isActive: program.is_active,
       totalScans: program.total_scans,
@@ -214,6 +221,7 @@ exports.getAttendees = async (req, res) => {
       age: attendee.age,
       sex: attendee.sex,
       isWinner: attendee.is_winner,
+      isGifted: attendee.is_gifted || false,
       scanTime: attendee.scan_time
     }));
 
@@ -230,9 +238,9 @@ exports.getAttendanceOverTime = async (req, res) => {
     const { id } = req.params;
     const churchId = req.churchId;
 
-    // Verify program belongs to church
+    // Verify program belongs to church and get start/end times
     const programCheck = await pool.query(
-      'SELECT id FROM programs WHERE id = $1 AND church_id = $2',
+      'SELECT id, start_time, end_time FROM programs WHERE id = $1 AND church_id = $2',
       [id, churchId]
     );
 
@@ -240,23 +248,49 @@ exports.getAttendanceOverTime = async (req, res) => {
       return res.status(404).json({ error: 'Program not found' });
     }
 
-    // Get scans grouped by 30-minute intervals
+    const program = programCheck.rows[0];
+
+    // Fetch raw scan timestamps (let JS handle timezone conversion)
     const result = await pool.query(
-      `SELECT 
-        TO_CHAR(DATE_TRUNC('hour', scan_time) + 
-          INTERVAL '30 min' * FLOOR(EXTRACT(MINUTE FROM scan_time) / 30), 'HH24:MI') as time_interval,
-        COUNT(*) as scan_count
-       FROM scans 
-       WHERE program_id = $1 
-       GROUP BY time_interval 
-       ORDER BY time_interval`,
+      'SELECT scan_time FROM scans WHERE program_id = $1 ORDER BY scan_time',
       [id]
     );
 
-    const attendanceData = result.rows.map(row => ({
-      time: row.time_interval,
-      scans: parseInt(row.scan_count)
-    }));
+    // Bucket scans by 30-minute intervals using local time (JS Date auto-converts to system timezone)
+    const scanMap = {};
+    result.rows.forEach(row => {
+      const d = new Date(row.scan_time);
+      const h = d.getHours();
+      const m = d.getMinutes() < 30 ? 0 : 30;
+      const label = `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
+      scanMap[label] = (scanMap[label] || 0) + 1;
+    });
+
+    // Parse program start/end times to generate all 30-minute slots
+    const parseTime = (timeStr) => {
+      const str = typeof timeStr === 'string' ? timeStr : timeStr.toString();
+      const parts = str.split(':');
+      return { hours: parseInt(parts[0]), minutes: parseInt(parts[1]) };
+    };
+
+    const start = parseTime(program.start_time);
+    const end = parseTime(program.end_time);
+
+    // Round start down to nearest 30-min boundary
+    const startMinutes = start.hours * 60 + (start.minutes < 30 ? 0 : 30);
+    // Round end up to nearest 30-min boundary
+    const endMinutes = end.hours * 60 + (end.minutes <= 0 ? 0 : end.minutes <= 30 ? 30 : 60);
+
+    const attendanceData = [];
+    for (let m = startMinutes; m <= endMinutes; m += 30) {
+      const h = Math.floor(m / 60);
+      const min = m % 60;
+      const label = `${h.toString().padStart(2, '0')}:${min.toString().padStart(2, '0')}`;
+      attendanceData.push({
+        time: label,
+        scans: scanMap[label] || 0
+      });
+    }
 
     res.json({ attendanceData });
   } catch (error) {
@@ -302,5 +336,55 @@ exports.getCountOnlyStats = async (req, res) => {
   } catch (error) {
     console.error('Get count-only stats error:', error);
     res.status(500).json({ error: 'Server error fetching statistics' });
+  }
+};
+
+// Mark winner as gifted
+exports.markWinnerGifted = async (req, res) => {
+  try {
+    const { id, attendeeId } = req.params;
+    const churchId = req.churchId;
+
+    // Verify program belongs to church
+    const programCheck = await pool.query(
+      'SELECT id FROM programs WHERE id = $1 AND church_id = $2',
+      [id, churchId]
+    );
+
+    if (programCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Program not found' });
+    }
+
+    // Update the attendee's is_gifted status
+    const result = await pool.query(
+      'UPDATE attendees SET is_gifted = true WHERE id = $1 AND program_id = $2 AND is_winner = true RETURNING *',
+      [attendeeId, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Winner not found' });
+    }
+
+    // Get updated winners gifted count
+    const giftedCount = await pool.query(
+      'SELECT COUNT(*) FROM attendees WHERE program_id = $1 AND is_winner = true AND is_gifted = true',
+      [id]
+    );
+
+    // Emit real-time update
+    const io = req.app.get('io');
+    io.emit(`program-${id}-update`, {
+      winnersGifted: parseInt(giftedCount.rows[0].count),
+      giftedAttendeeId: parseInt(attendeeId),
+      timestamp: new Date()
+    });
+
+    res.json({
+      success: true,
+      winnersGifted: parseInt(giftedCount.rows[0].count)
+    });
+  } catch (error) {
+    console.error('Mark winner gifted error:', error);
+    res.status(500).json({ error: 'Server error marking winner as gifted' });
   }
 };

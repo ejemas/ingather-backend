@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS attendees (
     age INTEGER,
     sex VARCHAR(20),
     is_winner BOOLEAN DEFAULT FALSE,
+    is_gifted BOOLEAN DEFAULT FALSE,
     device_fingerprint VARCHAR(500) NOT NULL,
     scan_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

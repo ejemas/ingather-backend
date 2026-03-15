@@ -64,6 +64,12 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 5000;
 
+// Auto-migrate: add is_gifted column if it doesn't exist
+const pool = require('./config/database');
+pool.query(`ALTER TABLE attendees ADD COLUMN IF NOT EXISTS is_gifted BOOLEAN DEFAULT FALSE`)
+  .then(() => console.log('✅ Migration check: is_gifted column ready'))
+  .catch(err => console.error('Migration warning:', err.message));
+
 server.listen(PORT, () => {
   console.log(`
 🚀 Server is running on port ${PORT}
