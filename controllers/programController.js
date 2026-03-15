@@ -388,3 +388,33 @@ exports.markWinnerGifted = async (req, res) => {
     res.status(500).json({ error: 'Server error marking winner as gifted' });
   }
 };
+
+// Delete a completed program
+exports.deleteProgram = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const churchId = req.churchId;
+
+    // Verify program belongs to church and is not active
+    const programCheck = await pool.query(
+      'SELECT id, is_active FROM programs WHERE id = $1 AND church_id = $2',
+      [id, churchId]
+    );
+
+    if (programCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Program not found' });
+    }
+
+    if (programCheck.rows[0].is_active) {
+      return res.status(400).json({ error: 'Cannot delete an active program. Stop it first.' });
+    }
+
+    // Delete program (CASCADE will remove attendees and scans)
+    await pool.query('DELETE FROM programs WHERE id = $1', [id]);
+
+    res.json({ success: true, message: 'Program deleted successfully' });
+  } catch (error) {
+    console.error('Delete program error:', error);
+    res.status(500).json({ error: 'Server error deleting program' });
+  }
+};

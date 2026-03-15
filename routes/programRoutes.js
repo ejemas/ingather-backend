@@ -44,4 +44,7 @@ router.get('/:id/count-stats', auth, programController.getCountOnlyStats);
 // Mark winner as gifted (protected)
 router.put('/:id/attendees/:attendeeId/gift-claimed', auth, programController.markWinnerGifted);
 
+// Delete program (protected)
+router.delete('/:id', auth, programController.deleteProgram);
+
 module.exports = router;
