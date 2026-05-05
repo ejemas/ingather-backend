@@ -23,8 +23,8 @@ router.post(
 // Get all programs (protected)
 router.get('/', auth, programController.getPrograms);
 
-// Get all programs (protected)
-router.get('/', auth, programController.getPrograms);
+// Get dashboard stats with date filtering (protected)
+router.get('/dashboard-stats', auth, programController.getDashboardStats);
 
 // Get single program (protected)
 router.get('/:id', auth, programController.getProgramById);

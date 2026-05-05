@@ -233,12 +233,16 @@ exports.getAttendees = async (req, res) => {
 };
 
 // Get attendance over time (for chart)
+// Uses simple SQL math for 30-minute bucketing (compatible with all PG versions).
+// scan_time is TIMESTAMP WITHOUT TIME ZONE — PostgreSQL stores it using the
+// session timezone (Africa/Lagos = WAT/UTC+1), so it is already local time.
+// No manual offset is needed.
 exports.getAttendanceOverTime = async (req, res) => {
   try {
     const { id } = req.params;
     const churchId = req.churchId;
 
-    // Verify program belongs to church and get start/end times
+    // Verify program ownership and fetch start/end times
     const programCheck = await pool.query(
       'SELECT id, start_time, end_time FROM programs WHERE id = $1 AND church_id = $2',
       [id, churchId]
@@ -250,49 +254,64 @@ exports.getAttendanceOverTime = async (req, res) => {
 
     const program = programCheck.rows[0];
 
-    // Fetch raw scan timestamps (let JS handle timezone conversion)
+    // 30-minute bucketing — scan_time is already in local time, no offset needed.
     const result = await pool.query(
-      'SELECT scan_time FROM scans WHERE program_id = $1 ORDER BY scan_time',
+      `SELECT
+        to_char(scan_time, 'HH24') || ':' ||
+        CASE
+          WHEN EXTRACT(MINUTE FROM scan_time) < 30 THEN '00'
+          ELSE '30'
+        END AS time_bucket,
+        COUNT(*) AS count
+      FROM scans
+      WHERE program_id = $1
+      GROUP BY 1
+      ORDER BY 1`,
       [id]
     );
 
-    // Bucket scans by 30-minute intervals using local time (JS Date auto-converts to system timezone)
-    const scanMap = {};
-    result.rows.forEach(row => {
-      const d = new Date(row.scan_time);
-      const h = d.getHours();
-      const m = d.getMinutes() < 30 ? 0 : 30;
-      const label = `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
-      scanMap[label] = (scanMap[label] || 0) + 1;
-    });
+    const buckets = result.rows.map(row => ({
+      time: row.time_bucket,
+      scans: parseInt(row.count)
+    }));
 
-    // Parse program start/end times to generate all 30-minute slots
-    const parseTime = (timeStr) => {
-      const str = typeof timeStr === 'string' ? timeStr : timeStr.toString();
+    // Also get the actual min/max scan bucket times so the frontend can
+    // extend the chart skeleton to cover all scans (not just the program window).
+    const rangeResult = await pool.query(
+      `SELECT
+        to_char(MIN(scan_time), 'HH24') || ':' ||
+        CASE
+          WHEN EXTRACT(MINUTE FROM MIN(scan_time)) < 30 THEN '00'
+          ELSE '30'
+        END AS min_bucket,
+        to_char(MAX(scan_time), 'HH24') || ':' ||
+        CASE
+          WHEN EXTRACT(MINUTE FROM MAX(scan_time)) < 30 THEN '00'
+          ELSE '30'
+        END AS max_bucket
+      FROM scans
+      WHERE program_id = $1`,
+      [id]
+    );
+
+    const scanRange = rangeResult.rows[0];
+
+    // Format start/end times as HH:MM for the frontend skeleton generator
+    const formatTime = (t) => {
+      const str = typeof t === 'string' ? t : t.toString();
       const parts = str.split(':');
-      return { hours: parseInt(parts[0]), minutes: parseInt(parts[1]) };
+      return `${parts[0].padStart(2, '0')}:${parts[1].padStart(2, '0')}`;
     };
 
-    const start = parseTime(program.start_time);
-    const end = parseTime(program.end_time);
+    console.log(`📊 Chart data: program=${id}, buckets=${buckets.length}, start=${formatTime(program.start_time)}, end=${formatTime(program.end_time)}, scanRange=${scanRange.min_bucket}-${scanRange.max_bucket}`);
 
-    // Round start down to nearest 30-min boundary
-    const startMinutes = start.hours * 60 + (start.minutes < 30 ? 0 : 30);
-    // Round end up to nearest 30-min boundary
-    const endMinutes = end.hours * 60 + (end.minutes <= 0 ? 0 : end.minutes <= 30 ? 30 : 60);
-
-    const attendanceData = [];
-    for (let m = startMinutes; m <= endMinutes; m += 30) {
-      const h = Math.floor(m / 60);
-      const min = m % 60;
-      const label = `${h.toString().padStart(2, '0')}:${min.toString().padStart(2, '0')}`;
-      attendanceData.push({
-        time: label,
-        scans: scanMap[label] || 0
-      });
-    }
-
-    res.json({ attendanceData });
+    res.json({
+      buckets,
+      startTime: formatTime(program.start_time),
+      endTime: formatTime(program.end_time),
+      scanRangeStart: scanRange.min_bucket || null,
+      scanRangeEnd: scanRange.max_bucket || null
+    });
   } catch (error) {
     console.error('Get attendance over time error:', error);
     res.status(500).json({ error: 'Server error fetching attendance data' });
@@ -386,6 +405,169 @@ exports.markWinnerGifted = async (req, res) => {
   } catch (error) {
     console.error('Mark winner gifted error:', error);
     res.status(500).json({ error: 'Server error marking winner as gifted' });
+  }
+};
+
+// Get dashboard statistics with date-range filtering
+exports.getDashboardStats = async (req, res) => {
+  try {
+    const churchId = req.churchId;
+    const { startDate, endDate } = req.query;
+
+    console.log(`📊 Dashboard stats request: churchId=${churchId}, startDate=${startDate}, endDate=${endDate}`);
+
+    // Build date filter clause — use explicit ::date cast for reliable comparison
+    let dateFilter = '';
+    const params = [churchId];
+    let paramIndex = 2;
+
+    if (startDate && endDate) {
+      dateFilter = ` AND p.date >= $${paramIndex}::date AND p.date <= $${paramIndex + 1}::date`;
+      params.push(startDate, endDate);
+      paramIndex += 2;
+    } else if (startDate) {
+      dateFilter = ` AND p.date >= $${paramIndex}::date`;
+      params.push(startDate);
+      paramIndex += 1;
+    } else if (endDate) {
+      dateFilter = ` AND p.date <= $${paramIndex}::date`;
+      params.push(endDate);
+      paramIndex += 1;
+    }
+
+    // 1. Total Programs & Total Attendance in range
+    const summaryResult = await pool.query(
+      `SELECT COUNT(*) as total_programs, COALESCE(SUM(total_scans), 0) as total_attendance
+       FROM programs p
+       WHERE p.church_id = $1${dateFilter}`,
+      params
+    );
+
+    const totalPrograms = parseInt(summaryResult.rows[0].total_programs);
+    const totalAttendance = parseInt(summaryResult.rows[0].total_attendance);
+
+    console.log(`📊 Found ${totalPrograms} programs, ${totalAttendance} total attendance in range`);
+
+    // 2. Upcoming Programs (date > today AND within range)
+    const today = new Date().toISOString().split('T')[0];
+    const upcomingParams = [churchId, today];
+    let upcomingDateFilter = '';
+    let upcomingParamIndex = 3;
+
+    if (startDate && endDate) {
+      upcomingDateFilter = ` AND p.date >= $${upcomingParamIndex}::date AND p.date <= $${upcomingParamIndex + 1}::date`;
+      upcomingParams.push(startDate, endDate);
+    } else if (endDate) {
+      upcomingDateFilter = ` AND p.date <= $${upcomingParamIndex}::date`;
+      upcomingParams.push(endDate);
+    }
+
+    const upcomingResult = await pool.query(
+      `SELECT COUNT(*) as upcoming_count
+       FROM programs p
+       WHERE p.church_id = $1 AND p.date > $2 AND p.is_active = true${upcomingDateFilter}`,
+      upcomingParams
+    );
+
+    const upcomingPrograms = parseInt(upcomingResult.rows[0].upcoming_count);
+
+    // 3. Gender / First-Timer breakdown from scans table (for count-only programs)
+    const scanStatsResult = await pool.query(
+      `SELECT 
+        COUNT(CASE WHEN s.gender = 'male' THEN 1 END) as male_count,
+        COUNT(CASE WHEN s.gender = 'female' THEN 1 END) as female_count,
+        COUNT(CASE WHEN s.first_timer = true THEN 1 END) as first_timer_count,
+        COUNT(*) as total_scans_with_data
+       FROM scans s
+       JOIN programs p ON s.program_id = p.id
+       WHERE p.church_id = $1${dateFilter}`,
+      params
+    );
+
+    // 4. Gender / First-Timer breakdown from attendees table (for collect-data programs)
+    const attendeeStatsResult = await pool.query(
+      `SELECT 
+        COUNT(CASE WHEN a.sex = 'Male' THEN 1 END) as male_count,
+        COUNT(CASE WHEN a.sex = 'Female' THEN 1 END) as female_count,
+        COUNT(CASE WHEN a.first_timer = true THEN 1 END) as first_timer_count,
+        COUNT(*) as total_attendees
+       FROM attendees a
+       JOIN programs p ON a.program_id = p.id
+       WHERE p.church_id = $1${dateFilter}`,
+      params
+    );
+
+    // Combine gender stats from both sources
+    const totalMale = parseInt(scanStatsResult.rows[0].male_count) + parseInt(attendeeStatsResult.rows[0].male_count);
+    const totalFemale = parseInt(scanStatsResult.rows[0].female_count) + parseInt(attendeeStatsResult.rows[0].female_count);
+    const totalFirstTimer = parseInt(scanStatsResult.rows[0].first_timer_count) + parseInt(attendeeStatsResult.rows[0].first_timer_count);
+    const totalPeople = totalMale + totalFemale + totalFirstTimer;
+
+    const genderBreakdown = {
+      femalePercent: totalPeople > 0 ? Math.round((totalFemale / totalPeople) * 100) : 0,
+      malePercent: totalPeople > 0 ? Math.round((totalMale / totalPeople) * 100) : 0,
+      firstTimerPercent: totalPeople > 0 ? Math.round((totalFirstTimer / totalPeople) * 100) : 0,
+      femaleCount: totalFemale,
+      maleCount: totalMale,
+      firstTimerCount: totalFirstTimer
+    };
+
+    // 5. Attendance over time — aggregate daily attendance across all programs
+    const chartResult = await pool.query(
+      `SELECT p.date,
+              SUM(p.total_scans) AS daily_attendance,
+              COUNT(*) AS program_count
+       FROM programs p
+       WHERE p.church_id = $1${dateFilter}
+       GROUP BY p.date
+       ORDER BY p.date ASC`,
+      params
+    );
+
+    const attendanceOvertime = chartResult.rows.map(row => {
+      const d = new Date(row.date + 'T00:00:00');
+      const dayLabel = d.toLocaleDateString('en-US', { weekday: 'short' });
+      const dayNum = d.getDate();
+      return {
+        name: `${dayLabel} ${dayNum}`,
+        date: row.date,
+        attendance: parseInt(row.daily_attendance) || 0,
+        programCount: parseInt(row.program_count)
+      };
+    });
+
+    // 6. Recent Programs in range
+    const programsResult = await pool.query(
+      `SELECT * FROM programs p
+       WHERE p.church_id = $1${dateFilter}
+       ORDER BY p.date DESC, p.start_time DESC`,
+      params
+    );
+
+    const recentPrograms = programsResult.rows.map(program => ({
+      id: program.id,
+      title: program.title,
+      date: program.date,
+      startTime: program.start_time,
+      endTime: program.end_time,
+      trackingMode: program.tracking_mode,
+      totalScans: program.total_scans,
+      isActive: program.is_active,
+      giftingEnabled: program.gifting_enabled,
+      createdAt: program.created_at
+    }));
+
+    res.json({
+      totalPrograms,
+      totalAttendance,
+      upcomingPrograms,
+      genderBreakdown,
+      attendanceOvertime,
+      recentPrograms
+    });
+  } catch (error) {
+    console.error('Get dashboard stats error:', error);
+    res.status(500).json({ error: 'Server error fetching dashboard statistics' });
   }
 };
 

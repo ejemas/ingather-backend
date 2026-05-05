@@ -68,3 +68,5 @@ CREATE INDEX idx_programs_church_id ON programs(church_id);
 CREATE INDEX idx_attendees_program_id ON attendees(program_id);
 CREATE INDEX idx_scans_program_id ON scans(program_id);
 CREATE INDEX idx_scans_device ON scans(device_fingerprint);
+CREATE INDEX idx_programs_date ON programs(church_id, date);
+CREATE INDEX idx_scans_time ON scans(program_id, scan_time);

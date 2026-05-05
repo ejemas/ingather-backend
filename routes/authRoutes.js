@@ -36,6 +36,9 @@ router.get('/me', auth, authController.getCurrentChurch);
 // Update church info (protected)
 router.put('/update', auth, authController.updateChurch);
 
+// Change password (protected)
+router.put('/change-password', auth, authController.changePassword);
+
 // Verify OTP
 router.post(
   '/verify-otp',
