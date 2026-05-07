@@ -28,3 +28,7 @@ CREATE TABLE IF NOT EXISTS notification_reads (
 );
 
 CREATE INDEX IF NOT EXISTS idx_notification_reads_church ON notification_reads(church_id);
+
+-- Migration: Expand logo_url column to TEXT to support base64-encoded images
+-- VARCHAR(500) is too small for base64 data (~30-50K characters)
+ALTER TABLE churches ALTER COLUMN logo_url TYPE TEXT;

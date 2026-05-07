@@ -300,6 +300,9 @@ exports.updateChurch = async (req, res) => {
     const { churchName, branchName, location, logoUrl } = req.body;
     const churchId = req.churchId;
 
+    // Auto-migrate: ensure logo_url column can hold base64 data
+    await pool.query(`ALTER TABLE churches ALTER COLUMN logo_url TYPE TEXT`);
+
     // If logoUrl is provided, update it too; otherwise keep existing
     let result;
     if (logoUrl !== undefined) {
