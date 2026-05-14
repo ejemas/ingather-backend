@@ -1,7 +1,90 @@
+const crypto = require('crypto');
 const pool = require('../config/database');
 
-// Handle QR scan
+const SCAN_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 
+const scanTokenSecret = () => process.env.SCAN_TOKEN_SECRET || process.env.JWT_SECRET || 'ingather-development-scan-secret';
+
+const createScanSessionToken = () => crypto.randomBytes(32).toString('base64url');
+
+const hashScanSessionToken = (token) => {
+  return crypto
+    .createHmac('sha256', scanTokenSecret())
+    .update(String(token || ''))
+    .digest('hex');
+};
+
+const safeEqual = (a, b) => {
+  const left = Buffer.from(String(a || ''));
+  const right = Buffer.from(String(b || ''));
+
+  if (left.length !== right.length) return false;
+
+  return crypto.timingSafeEqual(left, right);
+};
+
+const normalizeDeviceFingerprint = (deviceFingerprint) => {
+  if (typeof deviceFingerprint !== 'string') return null;
+
+  const trimmed = deviceFingerprint.trim();
+  if (!trimmed || trimmed.length > 500) return null;
+
+  return trimmed;
+};
+
+const getScanSessionToken = (req) => {
+  return req.body?.scanSessionToken || req.get('x-scan-session-token');
+};
+
+const verifyScanSession = async (client, programId, deviceFingerprint, token) => {
+  const normalizedFingerprint = normalizeDeviceFingerprint(deviceFingerprint);
+
+  if (!normalizedFingerprint || !token) {
+    return { status: 401, error: 'Valid scan session is required.' };
+  }
+
+  const scanResult = await client.query(
+    'SELECT * FROM scans WHERE program_id = $1 AND device_fingerprint = $2',
+    [programId, normalizedFingerprint]
+  );
+
+  if (scanResult.rows.length === 0) {
+    return { status: 400, error: 'No scan record found. Please scan the QR code first.' };
+  }
+
+  const scan = scanResult.rows[0];
+
+  if (!scan.scan_token_hash || !scan.scan_token_expires_at) {
+    return { status: 401, error: 'Scan session has expired. Please scan the QR code again.' };
+  }
+
+  if (new Date() > new Date(scan.scan_token_expires_at)) {
+    return { status: 401, error: 'Scan session has expired. Please scan the QR code again.' };
+  }
+
+  if (!safeEqual(scan.scan_token_hash, hashScanSessionToken(token))) {
+    return { status: 403, error: 'Invalid scan session.' };
+  }
+
+  return { scan, deviceFingerprint: normalizedFingerprint };
+};
+
+const getCountStats = async (programId) => {
+  const statsResult = await pool.query(
+    `SELECT 
+      COUNT(CASE WHEN gender = 'male' THEN 1 END) as male_count,
+      COUNT(CASE WHEN gender = 'female' THEN 1 END) as female_count,
+      COUNT(CASE WHEN first_timer = true THEN 1 END) as first_timer_count
+     FROM scans WHERE program_id = $1`,
+    [programId]
+  );
+
+  return {
+    maleCount: parseInt(statsResult.rows[0].male_count, 10),
+    femaleCount: parseInt(statsResult.rows[0].female_count, 10),
+    firstTimerCount: parseInt(statsResult.rows[0].first_timer_count, 10)
+  };
+};
 
 // Handle QR scan
 exports.scanQR = async (req, res) => {
@@ -9,11 +92,14 @@ exports.scanQR = async (req, res) => {
 
   try {
     const { programId } = req.params;
-    const { deviceFingerprint, formData } = req.body;
+    const deviceFingerprint = normalizeDeviceFingerprint(req.body.deviceFingerprint);
+
+    if (!deviceFingerprint) {
+      return res.status(400).json({ error: 'A valid device fingerprint is required' });
+    }
 
     await client.query('BEGIN');
 
-    // Check if program exists and is active
     const programResult = await client.query(
       'SELECT * FROM programs WHERE id = $1',
       [programId]
@@ -31,9 +117,8 @@ exports.scanQR = async (req, res) => {
       return res.status(400).json({ error: 'This program is no longer active' });
     }
 
-    // Check if device already scanned
     const scanCheck = await client.query(
-      'SELECT * FROM scans WHERE program_id = $1 AND device_fingerprint = $2',
+      'SELECT id FROM scans WHERE program_id = $1 AND device_fingerprint = $2',
       [programId, deviceFingerprint]
     );
 
@@ -45,14 +130,23 @@ exports.scanQR = async (req, res) => {
       });
     }
 
-    // Insert scan record (NEW SCAN)
-    // Insert scan record (with optional gender and first_timer data)
+    const scanSessionToken = createScanSessionToken();
+    const tokenExpiresAt = new Date(Date.now() + SCAN_TOKEN_TTL_MS);
+
     await client.query(
-      'INSERT INTO scans (program_id, device_fingerprint, gender, first_timer) VALUES ($1, $2, $3, $4)',
-      [programId, deviceFingerprint, req.body.gender || null, req.body.firstTimer || false]
+      `INSERT INTO scans 
+       (program_id, device_fingerprint, gender, first_timer, scan_token_hash, scan_token_expires_at) 
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [
+        programId,
+        deviceFingerprint,
+        req.body.gender || null,
+        req.body.firstTimer || false,
+        hashScanSessionToken(scanSessionToken),
+        tokenExpiresAt
+      ]
     );
 
-    // Increment total scans
     await client.query(
       'UPDATE programs SET total_scans = total_scans + 1 WHERE id = $1',
       [programId]
@@ -60,61 +154,46 @@ exports.scanQR = async (req, res) => {
 
     await client.query('COMMIT');
 
-    // Get updated total scans for real-time update
-    const updatedProgram = await client.query(
+    const updatedProgram = await pool.query(
       'SELECT total_scans FROM programs WHERE id = $1',
       [programId]
     );
 
     const totalScans = updatedProgram.rows[0].total_scans;
+    const countStats = await getCountStats(programId);
 
-    // Get gender/first-timer breakdown for real-time stats
-    const statsResult = await pool.query(
-      `SELECT 
-        COUNT(CASE WHEN gender = 'male' THEN 1 END) as male_count,
-        COUNT(CASE WHEN gender = 'female' THEN 1 END) as female_count,
-        COUNT(CASE WHEN first_timer = true THEN 1 END) as first_timer_count
-       FROM scans WHERE program_id = $1`,
-      [programId]
-    );
-
-    // Emit real-time update via Socket.io
     const io = req.app.get('io');
     io.emit(`program-${programId}-update`, {
-      totalScans: totalScans,
-      maleCount: parseInt(statsResult.rows[0].male_count),
-      femaleCount: parseInt(statsResult.rows[0].female_count),
-      firstTimerCount: parseInt(statsResult.rows[0].first_timer_count),
+      totalScans,
+      ...countStats,
       timestamp: new Date()
     });
 
-    // Return success with tracking mode info
-    // Return success with tracking mode info
-    // Return success with tracking mode info
     res.json({
       success: true,
       trackingMode: program.tracking_mode,
-      totalScans: totalScans,
+      totalScans,
       firstScan: true,
-      isFirstTimer: req.body.firstTimer || false
+      isFirstTimer: req.body.firstTimer || false,
+      scanSessionToken,
+      scanSessionExpiresAt: tokenExpiresAt
     });
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Scan error:', error);
 
-    if (error.code === '23505') { // Unique constraint violation
-      res.status(400).json({
+    if (error.code === '23505') {
+      return res.status(400).json({
         error: 'This device has already scanned this program',
         alreadyScanned: true
       });
-    } else {
-      res.status(500).json({ error: 'Server error processing scan' });
     }
+
+    return res.status(500).json({ error: 'Server error processing scan' });
   } finally {
     client.release();
   }
 };
-
 
 // Get program info for scan page (public endpoint)
 exports.getProgramInfo = async (req, res) => {
@@ -135,7 +214,7 @@ exports.getProgramInfo = async (req, res) => {
 
     const program = result.rows[0];
 
-    res.json({
+    return res.json({
       id: program.id,
       title: program.title,
       churchName: program.church_name,
@@ -148,14 +227,14 @@ exports.getProgramInfo = async (req, res) => {
       giftingEnabled: program.gifting_enabled,
       totalWinners: program.total_winners,
       winnersSelected: program.winners_selected,
+      flyerUrl: program.flyer_url,
       isActive: program.is_active
     });
   } catch (error) {
     console.error('Get program info error:', error);
-    res.status(500).json({ error: 'Server error' });
+    return res.status(500).json({ error: 'Server error' });
   }
 };
-
 
 // Submit form data only (scan already recorded)
 exports.submitFormData = async (req, res) => {
@@ -167,7 +246,6 @@ exports.submitFormData = async (req, res) => {
 
     await client.query('BEGIN');
 
-    // Check if program exists and is active
     const programResult = await client.query(
       'SELECT * FROM programs WHERE id = $1',
       [programId]
@@ -185,21 +263,15 @@ exports.submitFormData = async (req, res) => {
       return res.status(400).json({ error: 'This program is no longer active' });
     }
 
-    // Verify that this device has scanned (to prevent form submission without scan)
-    const scanCheck = await client.query(
-      'SELECT * FROM scans WHERE program_id = $1 AND device_fingerprint = $2',
-      [programId, deviceFingerprint]
-    );
-
-    if (scanCheck.rows.length === 0) {
+    const session = await verifyScanSession(client, programId, deviceFingerprint, getScanSessionToken(req));
+    if (session.error) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'No scan record found. Please scan the QR code first.' });
+      return res.status(session.status).json({ error: session.error });
     }
 
-    // Check if form already submitted by this device
     const attendeeCheck = await client.query(
-      'SELECT * FROM attendees WHERE program_id = $1 AND device_fingerprint = $2',
-      [programId, deviceFingerprint]
+      'SELECT id FROM attendees WHERE program_id = $1 AND device_fingerprint = $2',
+      [programId, session.deviceFingerprint]
     );
 
     if (attendeeCheck.rows.length > 0) {
@@ -209,9 +281,7 @@ exports.submitFormData = async (req, res) => {
 
     let isWinner = false;
 
-    // Determine if user is a winner (lucky dip)
     if (program.gifting_enabled && program.winners_selected < program.total_winners) {
-      // Random selection
       isWinner = Math.random() > 0.5;
 
       if (isWinner) {
@@ -222,7 +292,6 @@ exports.submitFormData = async (req, res) => {
       }
     }
 
-    // Insert attendee data
     await client.query(
       `INSERT INTO attendees 
        (program_id, full_name, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint) 
@@ -238,13 +307,12 @@ exports.submitFormData = async (req, res) => {
         formData.age || null,
         formData.sex || null,
         isWinner,
-        deviceFingerprint
+        session.deviceFingerprint
       ]
     );
 
     await client.query('COMMIT');
 
-    // Emit real-time update with attendee stats for collect-data mode
     const attendeeStats = await pool.query(
       `SELECT 
         COUNT(*) as total,
@@ -257,22 +325,22 @@ exports.submitFormData = async (req, res) => {
 
     const io = req.app.get('io');
     io.emit(`program-${programId}-update`, {
-      attendeeMaleCount: parseInt(attendeeStats.rows[0].male_count),
-      attendeeFemaleCount: parseInt(attendeeStats.rows[0].female_count),
-      attendeeFirstTimerCount: parseInt(attendeeStats.rows[0].first_timer_count),
-      attendeeTotal: parseInt(attendeeStats.rows[0].total),
+      attendeeMaleCount: parseInt(attendeeStats.rows[0].male_count, 10),
+      attendeeFemaleCount: parseInt(attendeeStats.rows[0].female_count, 10),
+      attendeeFirstTimerCount: parseInt(attendeeStats.rows[0].first_timer_count, 10),
+      attendeeTotal: parseInt(attendeeStats.rows[0].total, 10),
       timestamp: new Date()
     });
 
-    res.json({
+    return res.json({
       success: true,
-      isWinner: isWinner,
+      isWinner,
       giftingEnabled: program.gifting_enabled
     });
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Submit form error:', error);
-    res.status(500).json({ error: 'Server error submitting form' });
+    return res.status(500).json({ error: 'Server error submitting form' });
   } finally {
     client.release();
   }
@@ -280,48 +348,46 @@ exports.submitFormData = async (req, res) => {
 
 // Update existing scan with gender and first-timer data
 exports.updateScanData = async (req, res) => {
+  const client = await pool.connect();
+
   try {
     const { programId } = req.params;
     const { deviceFingerprint, gender, firstTimer } = req.body;
 
-    // Update the scan record
-    const result = await pool.query(
+    const session = await verifyScanSession(client, programId, deviceFingerprint, getScanSessionToken(req));
+    if (session.error) {
+      return res.status(session.status).json({ error: session.error });
+    }
+
+    const result = await client.query(
       `UPDATE scans 
        SET gender = $1, first_timer = $2 
        WHERE program_id = $3 AND device_fingerprint = $4
        RETURNING *`,
-      [gender, firstTimer, programId, deviceFingerprint]
+      [gender, Boolean(firstTimer), programId, session.deviceFingerprint]
     );
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Scan not found' });
     }
 
-    // Get updated stats and emit real-time update
-    const statsResult = await pool.query(
-      `SELECT 
-        COUNT(CASE WHEN gender = 'male' THEN 1 END) as male_count,
-        COUNT(CASE WHEN gender = 'female' THEN 1 END) as female_count,
-        COUNT(CASE WHEN first_timer = true THEN 1 END) as first_timer_count
-       FROM scans WHERE program_id = $1`,
-      [programId]
-    );
+    const countStats = await getCountStats(programId);
 
     const io = req.app.get('io');
     io.emit(`program-${programId}-update`, {
-      maleCount: parseInt(statsResult.rows[0].male_count),
-      femaleCount: parseInt(statsResult.rows[0].female_count),
-      firstTimerCount: parseInt(statsResult.rows[0].first_timer_count),
+      ...countStats,
       timestamp: new Date()
     });
 
-    res.json({
+    return res.json({
       success: true,
       message: 'Scan data updated successfully'
     });
   } catch (error) {
     console.error('Update scan error:', error);
-    res.status(500).json({ error: 'Server error updating scan data' });
+    return res.status(500).json({ error: 'Server error updating scan data' });
+  } finally {
+    client.release();
   }
 };
 
@@ -329,6 +395,15 @@ exports.updateScanData = async (req, res) => {
 exports.getScansForProgram = async (req, res) => {
   try {
     const { programId } = req.params;
+
+    const programCheck = await pool.query(
+      'SELECT id FROM programs WHERE id = $1 AND church_id = $2',
+      [programId, req.churchId]
+    );
+
+    if (programCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Program not found' });
+    }
 
     const result = await pool.query(
       `SELECT id, gender, first_timer, scan_time 
@@ -338,7 +413,7 @@ exports.getScansForProgram = async (req, res) => {
       [programId]
     );
 
-    res.json({
+    return res.json({
       scans: result.rows.map(scan => ({
         id: scan.id,
         gender: scan.gender,
@@ -348,6 +423,6 @@ exports.getScansForProgram = async (req, res) => {
     });
   } catch (error) {
     console.error('Get scans error:', error);
-    res.status(500).json({ error: 'Server error fetching scans' });
+    return res.status(500).json({ error: 'Server error fetching scans' });
   }
 };

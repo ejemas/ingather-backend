@@ -1,17 +1,68 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const pool = require('../config/database');
 const { generateOTP, sendOTPEmail, sendPasswordResetEmail } = require('../utils/emailService');
+
+const OTP_MAX_ATTEMPTS = 5;
+
+const otpSecret = () => process.env.OTP_SECRET || process.env.JWT_SECRET || 'ingather-development-otp-secret';
+
+const normalizeEmail = (email) => String(email || '').trim().toLowerCase();
+
+const hashOtp = (email, otp, purpose) => {
+  return crypto
+    .createHmac('sha256', otpSecret())
+    .update(`${normalizeEmail(email)}:${purpose}:${String(otp)}`)
+    .digest('hex');
+};
+
+const safeEqual = (a, b) => {
+  const left = Buffer.from(String(a || ''));
+  const right = Buffer.from(String(b || ''));
+
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(left, right);
+};
+
+const otpMatches = (church, email, otp, purpose) => {
+  if (!church.otp_code) return false;
+
+  if (church.otp_code === String(otp)) {
+    return true;
+  }
+
+  return safeEqual(church.otp_code, hashOtp(email, otp, purpose));
+};
+
+const hasOtpExpired = (church) => {
+  return !church.otp_expires_at || new Date() > new Date(church.otp_expires_at);
+};
+
+const hasTooManyOtpAttempts = (church) => {
+  return Number(church.otp_attempts || 0) >= OTP_MAX_ATTEMPTS;
+};
+
+const incrementOtpAttempts = (email) => {
+  return pool.query(
+    'UPDATE churches SET otp_attempts = COALESCE(otp_attempts, 0) + 1 WHERE email = $1',
+    [normalizeEmail(email)]
+  );
+};
 
 // Register Church
 exports.register = async (req, res) => {
   try {
     const { churchName, branchName, email, password, location, logoUrl } = req.body;
+    const normalizedEmail = normalizeEmail(email);
 
     // Check if church already exists
     const churchExists = await pool.query(
       'SELECT * FROM churches WHERE email = $1',
-      [email]
+      [normalizedEmail]
     );
 
     if (churchExists.rows.length > 0) {
@@ -24,19 +75,20 @@ exports.register = async (req, res) => {
 
     // Generate OTP
     const otp = generateOTP();
+    const hashedOtp = hashOtp(normalizedEmail, otp, 'verify');
     const otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
     // Insert church with OTP
     const result = await pool.query(
-      `INSERT INTO churches (church_name, branch_name, email, password, location, logo_url, is_verified, otp_code, otp_expires_at) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
+      `INSERT INTO churches (church_name, branch_name, email, password, location, logo_url, is_verified, otp_code, otp_expires_at, otp_attempts, otp_purpose) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10) 
        RETURNING id, church_name, branch_name, email, location`,
-      [churchName, branchName, email, hashedPassword, location, logoUrl || null, false, otp, otpExpiresAt]
+      [churchName, branchName, normalizedEmail, hashedPassword, location, logoUrl || null, false, hashedOtp, otpExpiresAt, 'verify']
     );
 
     // Send OTP email
-    await sendOTPEmail(email, otp);
-    console.log(`📧 OTP sent to ${email}`);
+    await sendOTPEmail(normalizedEmail, otp);
+    console.log(`OTP sent to ${normalizedEmail}`);
 
     res.status(201).json({
       message: 'Registration successful. Please verify your email.',
@@ -53,11 +105,12 @@ exports.register = async (req, res) => {
 exports.login = async (req, res) => {
   try {
     const { email, password } = req.body;
+    const normalizedEmail = normalizeEmail(email);
 
     // Check if church exists
     const result = await pool.query(
       'SELECT * FROM churches WHERE email = $1',
-      [email]
+      [normalizedEmail]
     );
 
     if (result.rows.length === 0) {
@@ -111,10 +164,11 @@ exports.login = async (req, res) => {
 exports.verifyOtp = async (req, res) => {
   try {
     const { email, otp } = req.body;
+    const normalizedEmail = normalizeEmail(email);
 
     const result = await pool.query(
       'SELECT * FROM churches WHERE email = $1',
-      [email]
+      [normalizedEmail]
     );
 
     if (result.rows.length === 0) {
@@ -127,20 +181,27 @@ exports.verifyOtp = async (req, res) => {
       return res.status(400).json({ error: 'Email is already verified' });
     }
 
-    // Check OTP match
-    if (church.otp_code !== otp) {
-      return res.status(400).json({ error: 'Invalid OTP code' });
+    if (church.otp_purpose && church.otp_purpose !== 'verify') {
+      return res.status(400).json({ error: 'Please request a new verification code.' });
     }
 
-    // Check OTP expiry
-    if (new Date() > new Date(church.otp_expires_at)) {
+    if (hasTooManyOtpAttempts(church)) {
+      return res.status(429).json({ error: 'Too many invalid attempts. Please request a new code.' });
+    }
+
+    if (hasOtpExpired(church)) {
       return res.status(400).json({ error: 'OTP has expired. Please request a new one.' });
+    }
+
+    if (!otpMatches(church, normalizedEmail, otp, 'verify')) {
+      await incrementOtpAttempts(normalizedEmail);
+      return res.status(400).json({ error: 'Invalid OTP code' });
     }
 
     // Mark as verified and clear OTP
     await pool.query(
-      'UPDATE churches SET is_verified = true, otp_code = NULL, otp_expires_at = NULL WHERE email = $1',
-      [email]
+      'UPDATE churches SET is_verified = true, otp_code = NULL, otp_expires_at = NULL, otp_attempts = 0, otp_purpose = NULL WHERE email = $1',
+      [normalizedEmail]
     );
 
     res.json({ message: 'Email verified successfully! You can now login.' });
@@ -154,10 +215,11 @@ exports.verifyOtp = async (req, res) => {
 exports.resendOtp = async (req, res) => {
   try {
     const { email } = req.body;
+    const normalizedEmail = normalizeEmail(email);
 
     const result = await pool.query(
       'SELECT * FROM churches WHERE email = $1',
-      [email]
+      [normalizedEmail]
     );
 
     if (result.rows.length === 0) {
@@ -172,15 +234,16 @@ exports.resendOtp = async (req, res) => {
 
     // Generate new OTP
     const otp = generateOTP();
+    const hashedOtp = hashOtp(normalizedEmail, otp, 'verify');
     const otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
     await pool.query(
-      'UPDATE churches SET otp_code = $1, otp_expires_at = $2 WHERE email = $3',
-      [otp, otpExpiresAt, email]
+      'UPDATE churches SET otp_code = $1, otp_expires_at = $2, otp_attempts = 0, otp_purpose = $3 WHERE email = $4',
+      [hashedOtp, otpExpiresAt, 'verify', normalizedEmail]
     );
 
-    await sendOTPEmail(email, otp);
-    console.log(`📧 OTP resent to ${email}`);
+    await sendOTPEmail(normalizedEmail, otp);
+    console.log(`OTP resent to ${normalizedEmail}`);
 
     res.json({ message: 'A new OTP has been sent to your email.' });
   } catch (error) {
@@ -193,10 +256,11 @@ exports.resendOtp = async (req, res) => {
 exports.forgotPassword = async (req, res) => {
   try {
     const { email } = req.body;
+    const normalizedEmail = normalizeEmail(email);
 
     const result = await pool.query(
       'SELECT * FROM churches WHERE email = $1',
-      [email]
+      [normalizedEmail]
     );
 
     if (result.rows.length === 0) {
@@ -206,15 +270,16 @@ exports.forgotPassword = async (req, res) => {
 
     // Generate OTP
     const otp = generateOTP();
+    const hashedOtp = hashOtp(normalizedEmail, otp, 'reset');
     const otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
     await pool.query(
-      'UPDATE churches SET otp_code = $1, otp_expires_at = $2 WHERE email = $3',
-      [otp, otpExpiresAt, email]
+      'UPDATE churches SET otp_code = $1, otp_expires_at = $2, otp_attempts = 0, otp_purpose = $3 WHERE email = $4',
+      [hashedOtp, otpExpiresAt, 'reset', normalizedEmail]
     );
 
-    await sendPasswordResetEmail(email, otp);
-    console.log(`📧 Password reset OTP sent to ${email}`);
+    await sendPasswordResetEmail(normalizedEmail, otp);
+    console.log(`Password reset OTP sent to ${normalizedEmail}`);
 
     res.json({ message: 'If an account exists with this email, an OTP has been sent.' });
   } catch (error) {
@@ -227,10 +292,11 @@ exports.forgotPassword = async (req, res) => {
 exports.resetPassword = async (req, res) => {
   try {
     const { email, otp, newPassword } = req.body;
+    const normalizedEmail = normalizeEmail(email);
 
     const result = await pool.query(
       'SELECT * FROM churches WHERE email = $1',
-      [email]
+      [normalizedEmail]
     );
 
     if (result.rows.length === 0) {
@@ -239,14 +305,21 @@ exports.resetPassword = async (req, res) => {
 
     const church = result.rows[0];
 
-    // Check OTP match
-    if (church.otp_code !== otp) {
-      return res.status(400).json({ error: 'Invalid OTP code' });
+    if (church.otp_purpose && church.otp_purpose !== 'reset') {
+      return res.status(400).json({ error: 'Please request a new password reset code.' });
     }
 
-    // Check OTP expiry
-    if (new Date() > new Date(church.otp_expires_at)) {
+    if (hasTooManyOtpAttempts(church)) {
+      return res.status(429).json({ error: 'Too many invalid attempts. Please request a new code.' });
+    }
+
+    if (hasOtpExpired(church)) {
       return res.status(400).json({ error: 'OTP has expired. Please request a new one.' });
+    }
+
+    if (!otpMatches(church, normalizedEmail, otp, 'reset')) {
+      await incrementOtpAttempts(normalizedEmail);
+      return res.status(400).json({ error: 'Invalid OTP code' });
     }
 
     // Hash new password
@@ -255,8 +328,8 @@ exports.resetPassword = async (req, res) => {
 
     // Update password and clear OTP
     await pool.query(
-      'UPDATE churches SET password = $1, otp_code = NULL, otp_expires_at = NULL WHERE email = $2',
-      [hashedPassword, email]
+      'UPDATE churches SET password = $1, otp_code = NULL, otp_expires_at = NULL, otp_attempts = 0, otp_purpose = NULL WHERE email = $2',
+      [hashedPassword, normalizedEmail]
     );
 
     res.json({ message: 'Password reset successfully! You can now login with your new password.' });
@@ -299,9 +372,6 @@ exports.updateChurch = async (req, res) => {
   try {
     const { churchName, branchName, location, logoUrl } = req.body;
     const churchId = req.churchId;
-
-    // Auto-migrate: ensure logo_url column can hold base64 data
-    await pool.query(`ALTER TABLE churches ALTER COLUMN logo_url TYPE TEXT`);
 
     // If logoUrl is provided, update it too; otherwise keep existing
     let result;

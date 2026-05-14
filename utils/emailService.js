@@ -1,4 +1,5 @@
 const { Resend } = require('resend');
+const crypto = require('crypto');
 
 let resend = null;
 
@@ -9,11 +10,8 @@ if (process.env.RESEND_API_KEY) {
   console.warn('⚠️ RESEND_API_KEY not set — email sending will fail. Add it to your environment variables.');
 }
 
-/**
- * Generate a random 4-digit OTP
- */
 const generateOTP = () => {
-  return Math.floor(1000 + Math.random() * 9000).toString();
+  return crypto.randomInt(100000, 1000000).toString();
 };
 
 /**

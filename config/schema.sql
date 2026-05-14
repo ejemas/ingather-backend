@@ -8,8 +8,10 @@ CREATE TABLE IF NOT EXISTS churches (
     location VARCHAR(255) NOT NULL,
     logo_url TEXT,
     is_verified BOOLEAN DEFAULT FALSE,
-    otp_code VARCHAR(10),
+    otp_code VARCHAR(255),
     otp_expires_at TIMESTAMP,
+    otp_attempts INTEGER DEFAULT 0,
+    otp_purpose VARCHAR(30),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -27,6 +29,9 @@ CREATE TABLE IF NOT EXISTS programs (
     gifting_enabled BOOLEAN DEFAULT FALSE,
     total_winners INTEGER DEFAULT 0,
     winners_selected INTEGER DEFAULT 0,
+    flyer_url TEXT,
+    flyer_storage_path TEXT,
+    flyer_original_name VARCHAR(255),
     qr_code_url VARCHAR(500),
     is_active BOOLEAN DEFAULT TRUE,
     total_scans INTEGER DEFAULT 0,
@@ -59,6 +64,8 @@ CREATE TABLE IF NOT EXISTS scans (
     device_fingerprint VARCHAR(500) NOT NULL,
     gender VARCHAR(20),
     first_timer BOOLEAN DEFAULT FALSE,
+    scan_token_hash VARCHAR(128),
+    scan_token_expires_at TIMESTAMP,
     scan_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(program_id, device_fingerprint)
 );

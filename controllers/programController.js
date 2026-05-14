@@ -1,5 +1,6 @@
 const pool = require('../config/database');
 const QRCode = require('qrcode');
+const { uploadEventFlyer, deleteEventFlyer } = require('../utils/supabaseStorage');
 
 // Create Program
 exports.createProgram = async (req, res) => {
@@ -12,29 +13,51 @@ exports.createProgram = async (req, res) => {
       trackingMode,
       dataFields,
       enableGifting,
-      numberOfWinners
+      numberOfWinners,
+      eventFlyer
     } = req.body;
 
     const churchId = req.churchId;
+    let uploadedFlyer = null;
+
+    if (eventFlyer?.dataUrl) {
+      uploadedFlyer = await uploadEventFlyer({
+        churchId,
+        dataUrl: eventFlyer.dataUrl
+      });
+    }
 
     // Insert program
-    const result = await pool.query(
-      `INSERT INTO programs 
-       (church_id, title, date, start_time, end_time, tracking_mode, data_fields, gifting_enabled, total_winners) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) 
-       RETURNING *`,
-      [
-        churchId,
-        programTitle,
-        date,
-        startTime,
-        endTime,
-        trackingMode,
-        JSON.stringify(dataFields),
-        enableGifting || false,
-        numberOfWinners || 0
-      ]
-    );
+    let result;
+    try {
+      result = await pool.query(
+        `INSERT INTO programs 
+         (church_id, title, date, start_time, end_time, tracking_mode, data_fields, gifting_enabled, total_winners, flyer_url, flyer_storage_path, flyer_original_name) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) 
+         RETURNING *`,
+        [
+          churchId,
+          programTitle,
+          date,
+          startTime,
+          endTime,
+          trackingMode,
+          JSON.stringify(dataFields),
+          enableGifting || false,
+          numberOfWinners || 0,
+          uploadedFlyer?.flyerUrl || null,
+          uploadedFlyer?.flyerStoragePath || null,
+          eventFlyer?.originalName || null
+        ]
+      );
+    } catch (error) {
+      if (uploadedFlyer?.flyerStoragePath) {
+        deleteEventFlyer(uploadedFlyer.flyerStoragePath).catch(deleteError => {
+          console.error('Flyer cleanup warning:', deleteError.message);
+        });
+      }
+      throw error;
+    }
 
     const program = result.rows[0];
 
@@ -62,6 +85,7 @@ exports.createProgram = async (req, res) => {
         dataFields: program.data_fields,
         giftingEnabled: program.gifting_enabled,
         totalWinners: program.total_winners,
+        flyerUrl: program.flyer_url,
         qrCodeUrl: qrCodeUrl,
         qrCodeImage: qrCodeImage,
         isActive: program.is_active,
@@ -70,7 +94,10 @@ exports.createProgram = async (req, res) => {
     });
   } catch (error) {
     console.error('Create program error:', error);
-    res.status(500).json({ error: 'Server error creating program' });
+    const isFlyerError = error.message?.includes('flyer') || error.message?.includes('Flyer') || error.message?.includes('Supabase');
+    res.status(isFlyerError ? 400 : 500).json({
+      error: isFlyerError ? error.message : 'Server error creating program'
+    });
   }
 };
 
@@ -95,6 +122,7 @@ exports.getPrograms = async (req, res) => {
       giftingEnabled: program.gifting_enabled,
       totalWinners: program.total_winners,
       winnersSelected: program.winners_selected,
+      flyerUrl: program.flyer_url,
       qrCodeUrl: program.qr_code_url,
       isActive: program.is_active,
       totalScans: program.total_scans,
@@ -155,6 +183,7 @@ exports.getProgramById = async (req, res) => {
       totalWinners: program.total_winners,
       winnersSelected: program.winners_selected,
       winnersGifted: parseInt(winnersGiftedResult.rows[0].count),
+      flyerUrl: program.flyer_url,
       qrCodeUrl: program.qr_code_url,
       isActive: program.is_active,
       totalScans: program.total_scans,
@@ -554,6 +583,7 @@ exports.getDashboardStats = async (req, res) => {
       totalScans: program.total_scans,
       isActive: program.is_active,
       giftingEnabled: program.gifting_enabled,
+      flyerUrl: program.flyer_url,
       createdAt: program.created_at
     }));
 
@@ -579,7 +609,7 @@ exports.deleteProgram = async (req, res) => {
 
     // Verify program belongs to church and is not active
     const programCheck = await pool.query(
-      'SELECT id, is_active FROM programs WHERE id = $1 AND church_id = $2',
+      'SELECT id, is_active, flyer_storage_path FROM programs WHERE id = $1 AND church_id = $2',
       [id, churchId]
     );
 
@@ -593,6 +623,12 @@ exports.deleteProgram = async (req, res) => {
 
     // Delete program (CASCADE will remove attendees and scans)
     await pool.query('DELETE FROM programs WHERE id = $1', [id]);
+
+    if (programCheck.rows[0].flyer_storage_path) {
+      deleteEventFlyer(programCheck.rows[0].flyer_storage_path).catch(deleteError => {
+        console.error('Flyer cleanup warning:', deleteError.message);
+      });
+    }
 
     res.json({ success: true, message: 'Program deleted successfully' });
   } catch (error) {

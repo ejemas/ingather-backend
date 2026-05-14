@@ -11,15 +11,53 @@ require('dotenv').config();
 
 const app = express();
 const server = http.createServer(app);
+
+app.set('trust proxy', 1);
+app.disable('x-powered-by');
+
+const configuredOrigins = (process.env.CORS_ORIGINS || process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
+
+const allowedOrigins = [
+  process.env.FRONTEND_URL,
+  ...configuredOrigins,
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+  'https://ingather.app',
+  'https://www.ingather.app'
+].filter(Boolean);
+
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error('Not allowed by CORS'));
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: false
+};
+
 const io = socketIo(server, {
   cors: {
-    origin: process.env.FRONTEND_URL,
+    origin: allowedOrigins,
     methods: ['GET', 'POST', 'PUT', 'DELETE']
   }
 });
 
 // Middleware
-app.use(cors());
+app.use(cors(corsOptions));
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  next();
+});
 app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 
@@ -64,6 +102,26 @@ const pool = require('./config/database');
 pool.query(`ALTER TABLE attendees ADD COLUMN IF NOT EXISTS is_gifted BOOLEAN DEFAULT FALSE`)
   .then(() => console.log('✅ Migration check: is_gifted column ready'))
   .catch(err => console.error('Migration warning:', err.message));
+
+// Auto-migrate: add security columns needed by scan tokens and OTP hardening
+pool.query(`
+  ALTER TABLE scans ADD COLUMN IF NOT EXISTS scan_token_hash VARCHAR(128);
+  ALTER TABLE scans ADD COLUMN IF NOT EXISTS scan_token_expires_at TIMESTAMP;
+  ALTER TABLE churches ALTER COLUMN otp_code TYPE VARCHAR(255);
+  ALTER TABLE churches ADD COLUMN IF NOT EXISTS otp_attempts INTEGER DEFAULT 0;
+  ALTER TABLE churches ADD COLUMN IF NOT EXISTS otp_purpose VARCHAR(30);
+`)
+  .then(() => console.log('Migration check: security columns ready'))
+  .catch(err => console.error('Migration warning (security columns):', err.message));
+
+// Auto-migrate: add optional program flyer metadata columns if they don't exist
+pool.query(`
+  ALTER TABLE programs ADD COLUMN IF NOT EXISTS flyer_url TEXT;
+  ALTER TABLE programs ADD COLUMN IF NOT EXISTS flyer_storage_path TEXT;
+  ALTER TABLE programs ADD COLUMN IF NOT EXISTS flyer_original_name VARCHAR(255);
+`)
+  .then(() => console.log('Migration check: program flyer columns ready'))
+  .catch(err => console.error('Migration warning (program flyers):', err.message));
 
 // Auto-migrate: create notifications tables if they don't exist
 pool.query(`

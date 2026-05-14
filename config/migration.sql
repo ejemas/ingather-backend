@@ -2,8 +2,11 @@
 -- Run this against your existing database
 
 ALTER TABLE churches ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE;
-ALTER TABLE churches ADD COLUMN IF NOT EXISTS otp_code VARCHAR(10);
+ALTER TABLE churches ADD COLUMN IF NOT EXISTS otp_code VARCHAR(255);
+ALTER TABLE churches ALTER COLUMN otp_code TYPE VARCHAR(255);
 ALTER TABLE churches ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMP;
+ALTER TABLE churches ADD COLUMN IF NOT EXISTS otp_attempts INTEGER DEFAULT 0;
+ALTER TABLE churches ADD COLUMN IF NOT EXISTS otp_purpose VARCHAR(30);
 
 -- Migration: Add composite index for daily attendance aggregation (Attendance Overtime chart)
 CREATE INDEX IF NOT EXISTS idx_programs_date ON programs(church_id, date);
@@ -32,3 +35,12 @@ CREATE INDEX IF NOT EXISTS idx_notification_reads_church ON notification_reads(c
 -- Migration: Expand logo_url column to TEXT to support base64-encoded images
 -- VARCHAR(500) is too small for base64 data (~30-50K characters)
 ALTER TABLE churches ALTER COLUMN logo_url TYPE TEXT;
+
+-- Migration: Optional event flyer metadata for programs
+ALTER TABLE programs ADD COLUMN IF NOT EXISTS flyer_url TEXT;
+ALTER TABLE programs ADD COLUMN IF NOT EXISTS flyer_storage_path TEXT;
+ALTER TABLE programs ADD COLUMN IF NOT EXISTS flyer_original_name VARCHAR(255);
+
+-- Migration: Scan session tokens for public scan follow-up mutations
+ALTER TABLE scans ADD COLUMN IF NOT EXISTS scan_token_hash VARCHAR(128);
+ALTER TABLE scans ADD COLUMN IF NOT EXISTS scan_token_expires_at TIMESTAMP;

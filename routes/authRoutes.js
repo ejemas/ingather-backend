@@ -4,10 +4,19 @@ const { body } = require('express-validator');
 const authController = require('../controllers/authController');
 const auth = require('../middleware/auth');
 const validate = require('../middleware/validation');
+const createRateLimiter = require('../middleware/rateLimit');
+
+const emailKey = (req) => `${req.ip}:${String(req.body?.email || '').toLowerCase()}`;
+const registerLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 8 });
+const loginLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 12, keyGenerator: emailKey });
+const otpVerifyLimiter = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 8, keyGenerator: emailKey });
+const otpSendLimiter = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 4, keyGenerator: emailKey });
+const passwordResetLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 6, keyGenerator: emailKey });
 
 // Register
 router.post(
   '/register',
+  registerLimiter,
   [
     body('churchName').notEmpty().withMessage('Church name is required'),
     body('branchName').notEmpty().withMessage('Branch name is required'),
@@ -22,6 +31,7 @@ router.post(
 // Login
 router.post(
   '/login',
+  loginLimiter,
   [
     body('email').isEmail().withMessage('Valid email is required'),
     body('password').notEmpty().withMessage('Password is required'),
@@ -42,6 +52,7 @@ router.put('/change-password', auth, authController.changePassword);
 // Verify OTP
 router.post(
   '/verify-otp',
+  otpVerifyLimiter,
   [
     body('email').isEmail().withMessage('Valid email is required'),
     body('otp').notEmpty().withMessage('OTP is required'),
@@ -53,6 +64,7 @@ router.post(
 // Resend OTP
 router.post(
   '/resend-otp',
+  otpSendLimiter,
   [
     body('email').isEmail().withMessage('Valid email is required'),
     validate
@@ -63,6 +75,7 @@ router.post(
 // Forgot Password
 router.post(
   '/forgot-password',
+  passwordResetLimiter,
   [
     body('email').isEmail().withMessage('Valid email is required'),
     validate
@@ -73,6 +86,7 @@ router.post(
 // Reset Password
 router.post(
   '/reset-password',
+  passwordResetLimiter,
   [
     body('email').isEmail().withMessage('Valid email is required'),
     body('otp').notEmpty().withMessage('OTP is required'),
