@@ -227,6 +227,10 @@ exports.getProgramInfo = async (req, res) => {
       giftingEnabled: program.gifting_enabled,
       totalWinners: program.total_winners,
       winnersSelected: program.winners_selected,
+      flyerType: program.flyer_type || 'standard',
+      personalizedFlyerConfig: program.personalized_flyer_config,
+      personalizedBackgroundUrl: program.personalized_background_url,
+      personalizedLogoUrl: program.personalized_logo_url,
       flyerUrl: program.flyer_url,
       isActive: program.is_active
     });

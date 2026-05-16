@@ -116,9 +116,17 @@ pool.query(`
 
 // Auto-migrate: add optional program flyer metadata columns if they don't exist
 pool.query(`
+  ALTER TABLE programs ADD COLUMN IF NOT EXISTS flyer_type VARCHAR(30) DEFAULT 'standard';
   ALTER TABLE programs ADD COLUMN IF NOT EXISTS flyer_url TEXT;
   ALTER TABLE programs ADD COLUMN IF NOT EXISTS flyer_storage_path TEXT;
   ALTER TABLE programs ADD COLUMN IF NOT EXISTS flyer_original_name VARCHAR(255);
+  ALTER TABLE programs ADD COLUMN IF NOT EXISTS personalized_flyer_config JSONB;
+  ALTER TABLE programs ADD COLUMN IF NOT EXISTS personalized_background_url TEXT;
+  ALTER TABLE programs ADD COLUMN IF NOT EXISTS personalized_background_storage_path TEXT;
+  ALTER TABLE programs ADD COLUMN IF NOT EXISTS personalized_background_original_name VARCHAR(255);
+  ALTER TABLE programs ADD COLUMN IF NOT EXISTS personalized_logo_url TEXT;
+  ALTER TABLE programs ADD COLUMN IF NOT EXISTS personalized_logo_storage_path TEXT;
+  ALTER TABLE programs ADD COLUMN IF NOT EXISTS personalized_logo_original_name VARCHAR(255);
 `)
   .then(() => console.log('Migration check: program flyer columns ready'))
   .catch(err => console.error('Migration warning (program flyers):', err.message));

@@ -2,6 +2,27 @@ const pool = require('../config/database');
 const QRCode = require('qrcode');
 const { uploadEventFlyer, deleteEventFlyer } = require('../utils/supabaseStorage');
 
+const normalizeFlyerType = (flyerType) => (
+  flyerType === 'personalized' ? 'personalized' : 'standard'
+);
+
+const normalizePersonalizedFlyerConfig = (config = {}) => {
+  const template = typeof config.template === 'string' ? config.template.trim() : '';
+
+  return {
+    template,
+    brandColor: typeof config.brandColor === 'string' && /^#[0-9A-Fa-f]{6}$/.test(config.brandColor)
+      ? config.brandColor
+      : '#E8590C',
+    textColor: typeof config.textColor === 'string' && /^#[0-9A-Fa-f]{6}$/.test(config.textColor)
+      ? config.textColor
+      : '#FFFFFF',
+    accentColor: typeof config.accentColor === 'string' && /^#[0-9A-Fa-f]{6}$/.test(config.accentColor)
+      ? config.accentColor
+      : '#FFB86B'
+  };
+};
+
 // Create Program
 exports.createProgram = async (req, res) => {
   try {
@@ -14,26 +35,66 @@ exports.createProgram = async (req, res) => {
       dataFields,
       enableGifting,
       numberOfWinners,
-      eventFlyer
+      eventFlyer,
+      flyerType: requestedFlyerType,
+      personalizedFlyerConfig,
+      personalizedBackground,
+      personalizedLogo
     } = req.body;
 
     const churchId = req.churchId;
+    const flyerType = normalizeFlyerType(requestedFlyerType);
+    const resolvedDataFields = { ...(dataFields || {}) };
+    const resolvedTrackingMode = flyerType === 'personalized' ? 'collect-data' : trackingMode;
+    const resolvedPersonalizedConfig = normalizePersonalizedFlyerConfig(personalizedFlyerConfig);
     let uploadedFlyer = null;
+    let uploadedPersonalizedBackground = null;
+    let uploadedPersonalizedLogo = null;
 
-    if (eventFlyer?.dataUrl) {
+    if (flyerType === 'personalized') {
+      resolvedDataFields.fullName = true;
+
+      if (!resolvedPersonalizedConfig.template) {
+        return res.status(400).json({ error: 'Personalized flyer message is required' });
+      }
+    }
+
+    if (flyerType === 'standard' && eventFlyer?.dataUrl) {
       uploadedFlyer = await uploadEventFlyer({
         churchId,
         dataUrl: eventFlyer.dataUrl
       });
     }
 
+    if (flyerType === 'personalized' && personalizedBackground?.dataUrl) {
+      uploadedPersonalizedBackground = await uploadEventFlyer({
+        churchId,
+        dataUrl: personalizedBackground.dataUrl
+      });
+    }
+
+    if (flyerType === 'personalized' && personalizedLogo?.dataUrl) {
+      uploadedPersonalizedLogo = await uploadEventFlyer({
+        churchId,
+        dataUrl: personalizedLogo.dataUrl
+      });
+    }
+
+    const personalizedConfigForStorage = flyerType === 'personalized'
+      ? {
+          ...resolvedPersonalizedConfig,
+          backgroundUrl: uploadedPersonalizedBackground?.flyerUrl || null,
+          logoUrl: uploadedPersonalizedLogo?.flyerUrl || null
+        }
+      : null;
+
     // Insert program
     let result;
     try {
       result = await pool.query(
         `INSERT INTO programs 
-         (church_id, title, date, start_time, end_time, tracking_mode, data_fields, gifting_enabled, total_winners, flyer_url, flyer_storage_path, flyer_original_name) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) 
+         (church_id, title, date, start_time, end_time, tracking_mode, data_fields, gifting_enabled, total_winners, flyer_type, flyer_url, flyer_storage_path, flyer_original_name, personalized_flyer_config, personalized_background_url, personalized_background_storage_path, personalized_background_original_name, personalized_logo_url, personalized_logo_storage_path, personalized_logo_original_name) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) 
          RETURNING *`,
         [
           churchId,
@@ -41,19 +102,37 @@ exports.createProgram = async (req, res) => {
           date,
           startTime,
           endTime,
-          trackingMode,
-          JSON.stringify(dataFields),
+          resolvedTrackingMode,
+          JSON.stringify(resolvedDataFields),
           enableGifting || false,
           numberOfWinners || 0,
+          flyerType,
           uploadedFlyer?.flyerUrl || null,
           uploadedFlyer?.flyerStoragePath || null,
-          eventFlyer?.originalName || null
+          eventFlyer?.originalName || null,
+          personalizedConfigForStorage ? JSON.stringify(personalizedConfigForStorage) : null,
+          uploadedPersonalizedBackground?.flyerUrl || null,
+          uploadedPersonalizedBackground?.flyerStoragePath || null,
+          personalizedBackground?.originalName || null,
+          uploadedPersonalizedLogo?.flyerUrl || null,
+          uploadedPersonalizedLogo?.flyerStoragePath || null,
+          personalizedLogo?.originalName || null
         ]
       );
     } catch (error) {
       if (uploadedFlyer?.flyerStoragePath) {
         deleteEventFlyer(uploadedFlyer.flyerStoragePath).catch(deleteError => {
           console.error('Flyer cleanup warning:', deleteError.message);
+        });
+      }
+      if (uploadedPersonalizedBackground?.flyerStoragePath) {
+        deleteEventFlyer(uploadedPersonalizedBackground.flyerStoragePath).catch(deleteError => {
+          console.error('Personalized flyer cleanup warning:', deleteError.message);
+        });
+      }
+      if (uploadedPersonalizedLogo?.flyerStoragePath) {
+        deleteEventFlyer(uploadedPersonalizedLogo.flyerStoragePath).catch(deleteError => {
+          console.error('Personalized logo cleanup warning:', deleteError.message);
         });
       }
       throw error;
@@ -85,6 +164,10 @@ exports.createProgram = async (req, res) => {
         dataFields: program.data_fields,
         giftingEnabled: program.gifting_enabled,
         totalWinners: program.total_winners,
+        flyerType: program.flyer_type,
+        personalizedFlyerConfig: program.personalized_flyer_config,
+        personalizedBackgroundUrl: program.personalized_background_url,
+        personalizedLogoUrl: program.personalized_logo_url,
         flyerUrl: program.flyer_url,
         qrCodeUrl: qrCodeUrl,
         qrCodeImage: qrCodeImage,
@@ -122,6 +205,10 @@ exports.getPrograms = async (req, res) => {
       giftingEnabled: program.gifting_enabled,
       totalWinners: program.total_winners,
       winnersSelected: program.winners_selected,
+      flyerType: program.flyer_type || 'standard',
+      personalizedFlyerConfig: program.personalized_flyer_config,
+      personalizedBackgroundUrl: program.personalized_background_url,
+      personalizedLogoUrl: program.personalized_logo_url,
       flyerUrl: program.flyer_url,
       qrCodeUrl: program.qr_code_url,
       isActive: program.is_active,
@@ -183,6 +270,10 @@ exports.getProgramById = async (req, res) => {
       totalWinners: program.total_winners,
       winnersSelected: program.winners_selected,
       winnersGifted: parseInt(winnersGiftedResult.rows[0].count),
+      flyerType: program.flyer_type || 'standard',
+      personalizedFlyerConfig: program.personalized_flyer_config,
+      personalizedBackgroundUrl: program.personalized_background_url,
+      personalizedLogoUrl: program.personalized_logo_url,
       flyerUrl: program.flyer_url,
       qrCodeUrl: program.qr_code_url,
       isActive: program.is_active,
@@ -583,6 +674,10 @@ exports.getDashboardStats = async (req, res) => {
       totalScans: program.total_scans,
       isActive: program.is_active,
       giftingEnabled: program.gifting_enabled,
+      flyerType: program.flyer_type || 'standard',
+      personalizedFlyerConfig: program.personalized_flyer_config,
+      personalizedBackgroundUrl: program.personalized_background_url,
+      personalizedLogoUrl: program.personalized_logo_url,
       flyerUrl: program.flyer_url,
       createdAt: program.created_at
     }));
@@ -609,7 +704,7 @@ exports.deleteProgram = async (req, res) => {
 
     // Verify program belongs to church and is not active
     const programCheck = await pool.query(
-      'SELECT id, is_active, flyer_storage_path FROM programs WHERE id = $1 AND church_id = $2',
+      'SELECT id, is_active, flyer_storage_path, personalized_background_storage_path, personalized_logo_storage_path FROM programs WHERE id = $1 AND church_id = $2',
       [id, churchId]
     );
 
@@ -627,6 +722,18 @@ exports.deleteProgram = async (req, res) => {
     if (programCheck.rows[0].flyer_storage_path) {
       deleteEventFlyer(programCheck.rows[0].flyer_storage_path).catch(deleteError => {
         console.error('Flyer cleanup warning:', deleteError.message);
+      });
+    }
+
+    if (programCheck.rows[0].personalized_background_storage_path) {
+      deleteEventFlyer(programCheck.rows[0].personalized_background_storage_path).catch(deleteError => {
+        console.error('Personalized flyer cleanup warning:', deleteError.message);
+      });
+    }
+
+    if (programCheck.rows[0].personalized_logo_storage_path) {
+      deleteEventFlyer(programCheck.rows[0].personalized_logo_storage_path).catch(deleteError => {
+        console.error('Personalized logo cleanup warning:', deleteError.message);
       });
     }
 

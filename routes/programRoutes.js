@@ -15,6 +15,7 @@ router.post(
     body('startTime').notEmpty().withMessage('Start time is required'),
     body('endTime').notEmpty().withMessage('End time is required'),
     body('trackingMode').isIn(['count-only', 'collect-data']).withMessage('Invalid tracking mode'),
+    body('flyerType').optional().isIn(['standard', 'personalized']).withMessage('Invalid flyer type'),
     validate
   ],
   programController.createProgram
