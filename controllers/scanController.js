@@ -89,6 +89,7 @@ const getCountStats = async (programId) => {
 // Handle QR scan
 exports.scanQR = async (req, res) => {
   const client = await pool.connect();
+  let transactionStarted = false;
 
   try {
     const { programId } = req.params;
@@ -99,9 +100,10 @@ exports.scanQR = async (req, res) => {
     }
 
     await client.query('BEGIN');
+    transactionStarted = true;
 
     const programResult = await client.query(
-      'SELECT * FROM programs WHERE id = $1',
+      'SELECT id, tracking_mode, is_active FROM programs WHERE id = $1',
       [programId]
     );
 
@@ -117,26 +119,15 @@ exports.scanQR = async (req, res) => {
       return res.status(400).json({ error: 'This program is no longer active' });
     }
 
-    const scanCheck = await client.query(
-      'SELECT id FROM scans WHERE program_id = $1 AND device_fingerprint = $2',
-      [programId, deviceFingerprint]
-    );
-
-    if (scanCheck.rows.length > 0) {
-      await client.query('ROLLBACK');
-      return res.status(400).json({
-        error: 'This device has already scanned this program',
-        alreadyScanned: true
-      });
-    }
-
     const scanSessionToken = createScanSessionToken();
     const tokenExpiresAt = new Date(Date.now() + SCAN_TOKEN_TTL_MS);
 
-    await client.query(
+    const scanInsert = await client.query(
       `INSERT INTO scans 
        (program_id, device_fingerprint, gender, first_timer, scan_token_hash, scan_token_expires_at) 
-       VALUES ($1, $2, $3, $4, $5, $6)`,
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (program_id, device_fingerprint) DO NOTHING
+       RETURNING id`,
       [
         programId,
         deviceFingerprint,
@@ -147,28 +138,24 @@ exports.scanQR = async (req, res) => {
       ]
     );
 
-    await client.query(
-      'UPDATE programs SET total_scans = total_scans + 1 WHERE id = $1',
+    if (scanInsert.rows.length === 0) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(400).json({
+        error: 'This device has already scanned this program',
+        alreadyScanned: true
+      });
+    }
+
+    const updatedProgram = await client.query(
+      'UPDATE programs SET total_scans = total_scans + 1 WHERE id = $1 RETURNING total_scans',
       [programId]
     );
 
     await client.query('COMMIT');
-
-    const updatedProgram = await pool.query(
-      'SELECT total_scans FROM programs WHERE id = $1',
-      [programId]
-    );
+    transactionStarted = false;
 
     const totalScans = updatedProgram.rows[0].total_scans;
-    const countStats = await getCountStats(programId);
-
-    const io = req.app.get('io');
-    io.emit(`program-${programId}-update`, {
-      totalScans,
-      ...countStats,
-      timestamp: new Date()
-    });
-
     res.json({
       success: true,
       trackingMode: program.tracking_mode,
@@ -178,8 +165,24 @@ exports.scanQR = async (req, res) => {
       scanSessionToken,
       scanSessionExpiresAt: tokenExpiresAt
     });
+
+    setImmediate(async () => {
+      try {
+        const countStats = await getCountStats(programId);
+        const io = req.app.get('io');
+        io.emit(`program-${programId}-update`, {
+          totalScans,
+          ...countStats,
+          timestamp: new Date()
+        });
+      } catch (statsError) {
+        console.error('Post-scan stats update warning:', statsError);
+      }
+    });
   } catch (error) {
-    await client.query('ROLLBACK');
+    if (transactionStarted) {
+      await client.query('ROLLBACK');
+    }
     console.error('Scan error:', error);
 
     if (error.code === '23505') {
