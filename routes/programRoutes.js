@@ -27,6 +27,12 @@ router.get('/', auth, programController.getPrograms);
 // Get dashboard stats with date filtering (protected)
 router.get('/dashboard-stats', auth, programController.getDashboardStats);
 
+// Get dashboard bootstrap data with church, notifications, and stats (protected)
+router.get('/dashboard-bootstrap', auth, programController.getDashboardBootstrap);
+
+// Get program detail bootstrap data (protected)
+router.get('/:id/detail-bootstrap', auth, programController.getProgramDetailBootstrap);
+
 // Get single program (protected)
 router.get('/:id', auth, programController.getProgramById);
 

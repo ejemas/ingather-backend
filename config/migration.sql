@@ -13,6 +13,8 @@ CREATE INDEX IF NOT EXISTS idx_programs_date ON programs(church_id, date);
 
 -- Migration: Add composite index for 30-minute time-series bucketing (Attendance Overtime per-program chart)
 CREATE INDEX IF NOT EXISTS idx_scans_time ON scans(program_id, scan_time);
+CREATE INDEX IF NOT EXISTS idx_attendees_program_time ON attendees(program_id, scan_time DESC);
+CREATE INDEX IF NOT EXISTS idx_attendees_program_winner_gifted ON attendees(program_id, is_winner, is_gifted);
 
 -- Migration: System Notifications (broadcast table + per-church read tracking)
 CREATE TABLE IF NOT EXISTS notifications (
@@ -31,6 +33,7 @@ CREATE TABLE IF NOT EXISTS notification_reads (
 );
 
 CREATE INDEX IF NOT EXISTS idx_notification_reads_church ON notification_reads(church_id);
+CREATE INDEX IF NOT EXISTS idx_notification_reads_notification_church ON notification_reads(notification_id, church_id);
 
 -- Migration: Expand logo_url column to TEXT to support base64-encoded images
 -- VARCHAR(500) is too small for base64 data (~30-50K characters)

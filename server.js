@@ -103,6 +103,15 @@ pool.query(`ALTER TABLE attendees ADD COLUMN IF NOT EXISTS is_gifted BOOLEAN DEF
   .then(() => console.log('✅ Migration check: is_gifted column ready'))
   .catch(err => console.error('Migration warning:', err.message));
 
+// Auto-migrate: add performance indexes for dashboard and program detail reads
+pool.query(`
+  ALTER TABLE attendees ADD COLUMN IF NOT EXISTS is_gifted BOOLEAN DEFAULT FALSE;
+  CREATE INDEX IF NOT EXISTS idx_attendees_program_time ON attendees(program_id, scan_time DESC);
+  CREATE INDEX IF NOT EXISTS idx_attendees_program_winner_gifted ON attendees(program_id, is_winner, is_gifted);
+`)
+  .then(() => console.log('Migration check: performance indexes ready'))
+  .catch(err => console.error('Migration warning (performance indexes):', err.message));
+
 // Auto-migrate: add security columns needed by scan tokens and OTP hardening
 pool.query(`
   ALTER TABLE scans ADD COLUMN IF NOT EXISTS scan_token_hash VARCHAR(128);
@@ -146,6 +155,7 @@ pool.query(`
     read_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(notification_id, church_id)
   );
+  CREATE INDEX IF NOT EXISTS idx_notification_reads_notification_church ON notification_reads(notification_id, church_id);
 `)
   .then(() => console.log('✅ Migration check: notifications tables ready'))
   .catch(err => console.error('Migration warning (notifications):', err.message));

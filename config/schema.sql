@@ -81,6 +81,8 @@ CREATE TABLE IF NOT EXISTS scans (
 -- Indexes for performance
 CREATE INDEX idx_programs_church_id ON programs(church_id);
 CREATE INDEX idx_attendees_program_id ON attendees(program_id);
+CREATE INDEX idx_attendees_program_time ON attendees(program_id, scan_time DESC);
+CREATE INDEX idx_attendees_program_winner_gifted ON attendees(program_id, is_winner, is_gifted);
 CREATE INDEX idx_scans_program_id ON scans(program_id);
 CREATE INDEX idx_scans_device ON scans(device_fingerprint);
 CREATE INDEX idx_programs_date ON programs(church_id, date);

@@ -23,6 +23,293 @@ const normalizePersonalizedFlyerConfig = (config = {}) => {
   };
 };
 
+const mapChurch = (church) => ({
+  id: church.id,
+  churchName: church.church_name,
+  branchName: church.branch_name,
+  email: church.email,
+  location: church.location,
+  logoUrl: church.logo_url,
+  createdAt: church.created_at
+});
+
+const mapProgramDetail = (program, counts = {}) => ({
+  id: program.id,
+  title: program.title,
+  date: program.date,
+  startTime: program.start_time,
+  endTime: program.end_time,
+  trackingMode: program.tracking_mode,
+  dataFields: program.data_fields,
+  giftingEnabled: program.gifting_enabled,
+  totalWinners: program.total_winners,
+  winnersSelected: program.winners_selected,
+  winnersGifted: counts.winnersGifted || 0,
+  flyerType: program.flyer_type || 'standard',
+  personalizedFlyerConfig: program.personalized_flyer_config,
+  personalizedBackgroundUrl: program.personalized_background_url,
+  personalizedLogoUrl: program.personalized_logo_url,
+  flyerUrl: program.flyer_url,
+  qrCodeUrl: program.qr_code_url,
+  isActive: program.is_active,
+  totalScans: program.total_scans,
+  attendeesCount: counts.attendeesCount || 0,
+  firstTimersCount: counts.firstTimersCount || 0
+});
+
+const mapAttendee = (attendee) => ({
+  id: attendee.id,
+  fullName: attendee.full_name,
+  phoneNumber: attendee.phone_number,
+  address: attendee.address,
+  firstTimer: attendee.first_timer,
+  department: attendee.department,
+  fellowship: attendee.fellowship,
+  age: attendee.age,
+  sex: attendee.sex,
+  isWinner: attendee.is_winner,
+  isGifted: attendee.is_gifted || false,
+  scanTime: attendee.scan_time
+});
+
+const mapScan = (scan) => ({
+  id: scan.id,
+  gender: scan.gender,
+  firstTimer: scan.first_timer,
+  scanTime: scan.scan_time
+});
+
+const formatProgramTime = (time) => {
+  const str = typeof time === 'string' ? time : time.toString();
+  const parts = str.split(':');
+  return `${parts[0].padStart(2, '0')}:${parts[1].padStart(2, '0')}`;
+};
+
+const getChurchProfile = async (churchId) => {
+  const result = await pool.query(
+    'SELECT id, church_name, branch_name, email, location, logo_url, created_at FROM churches WHERE id = $1',
+    [churchId]
+  );
+
+  return result.rows.length > 0 ? mapChurch(result.rows[0]) : null;
+};
+
+const getUnreadCountForChurch = async (churchId) => {
+  const result = await pool.query(
+    `SELECT COUNT(*) AS unread
+     FROM notifications n
+     WHERE NOT EXISTS (
+       SELECT 1 FROM notification_reads nr
+       WHERE nr.notification_id = n.id AND nr.church_id = $1
+     )`,
+    [churchId]
+  );
+
+  return parseInt(result.rows[0].unread, 10);
+};
+
+const buildDashboardStatsPayload = async (churchId, startDate, endDate) => {
+  let dateFilter = '';
+  const params = [churchId];
+  let paramIndex = 2;
+
+  if (startDate && endDate) {
+    dateFilter = ` AND p.date >= $${paramIndex}::date AND p.date <= $${paramIndex + 1}::date`;
+    params.push(startDate, endDate);
+    paramIndex += 2;
+  } else if (startDate) {
+    dateFilter = ` AND p.date >= $${paramIndex}::date`;
+    params.push(startDate);
+    paramIndex += 1;
+  } else if (endDate) {
+    dateFilter = ` AND p.date <= $${paramIndex}::date`;
+    params.push(endDate);
+    paramIndex += 1;
+  }
+
+  const today = new Date().toISOString().split('T')[0];
+  const upcomingParams = [churchId, today];
+  let upcomingDateFilter = '';
+  let upcomingParamIndex = 3;
+
+  if (startDate && endDate) {
+    upcomingDateFilter = ` AND p.date >= $${upcomingParamIndex}::date AND p.date <= $${upcomingParamIndex + 1}::date`;
+    upcomingParams.push(startDate, endDate);
+  } else if (endDate) {
+    upcomingDateFilter = ` AND p.date <= $${upcomingParamIndex}::date`;
+    upcomingParams.push(endDate);
+  }
+
+  const [
+    summaryResult,
+    upcomingResult,
+    scanStatsResult,
+    attendeeStatsResult,
+    chartResult,
+    programsResult
+  ] = await Promise.all([
+    pool.query(
+      `SELECT COUNT(*) as total_programs, COALESCE(SUM(total_scans), 0) as total_attendance
+       FROM programs p
+       WHERE p.church_id = $1${dateFilter}`,
+      params
+    ),
+    pool.query(
+      `SELECT COUNT(*) as upcoming_count
+       FROM programs p
+       WHERE p.church_id = $1 AND p.date > $2 AND p.is_active = true${upcomingDateFilter}`,
+      upcomingParams
+    ),
+    pool.query(
+      `SELECT
+        COUNT(CASE WHEN s.gender = 'male' THEN 1 END) as male_count,
+        COUNT(CASE WHEN s.gender = 'female' THEN 1 END) as female_count,
+        COUNT(CASE WHEN s.first_timer = true THEN 1 END) as first_timer_count,
+        COUNT(*) as total_scans_with_data
+       FROM scans s
+       JOIN programs p ON s.program_id = p.id
+       WHERE p.church_id = $1${dateFilter}`,
+      params
+    ),
+    pool.query(
+      `SELECT
+        COUNT(CASE WHEN a.sex = 'Male' THEN 1 END) as male_count,
+        COUNT(CASE WHEN a.sex = 'Female' THEN 1 END) as female_count,
+        COUNT(CASE WHEN a.first_timer = true THEN 1 END) as first_timer_count,
+        COUNT(*) as total_attendees
+       FROM attendees a
+       JOIN programs p ON a.program_id = p.id
+       WHERE p.church_id = $1${dateFilter}`,
+      params
+    ),
+    pool.query(
+      `SELECT p.date,
+              SUM(p.total_scans) AS daily_attendance,
+              COUNT(*) AS program_count
+       FROM programs p
+       WHERE p.church_id = $1${dateFilter}
+       GROUP BY p.date
+       ORDER BY p.date ASC`,
+      params
+    ),
+    pool.query(
+      `SELECT * FROM programs p
+       WHERE p.church_id = $1${dateFilter}
+       ORDER BY p.date DESC, p.start_time DESC`,
+      params
+    )
+  ]);
+
+  const totalMale = parseInt(scanStatsResult.rows[0].male_count, 10) + parseInt(attendeeStatsResult.rows[0].male_count, 10);
+  const totalFemale = parseInt(scanStatsResult.rows[0].female_count, 10) + parseInt(attendeeStatsResult.rows[0].female_count, 10);
+  const totalFirstTimer = parseInt(scanStatsResult.rows[0].first_timer_count, 10) + parseInt(attendeeStatsResult.rows[0].first_timer_count, 10);
+  const totalPeople = totalMale + totalFemale + totalFirstTimer;
+
+  return {
+    totalPrograms: parseInt(summaryResult.rows[0].total_programs, 10),
+    totalAttendance: parseInt(summaryResult.rows[0].total_attendance, 10),
+    upcomingPrograms: parseInt(upcomingResult.rows[0].upcoming_count, 10),
+    genderBreakdown: {
+      femalePercent: totalPeople > 0 ? Math.round((totalFemale / totalPeople) * 100) : 0,
+      malePercent: totalPeople > 0 ? Math.round((totalMale / totalPeople) * 100) : 0,
+      firstTimerPercent: totalPeople > 0 ? Math.round((totalFirstTimer / totalPeople) * 100) : 0,
+      femaleCount: totalFemale,
+      maleCount: totalMale,
+      firstTimerCount: totalFirstTimer
+    },
+    attendanceOvertime: chartResult.rows.map(row => {
+      const date = new Date(row.date + 'T00:00:00');
+      return {
+        name: `${date.toLocaleDateString('en-US', { weekday: 'short' })} ${date.getDate()}`,
+        date: row.date,
+        attendance: parseInt(row.daily_attendance, 10) || 0,
+        programCount: parseInt(row.program_count, 10)
+      };
+    }),
+    recentPrograms: programsResult.rows.map(program => ({
+      id: program.id,
+      title: program.title,
+      date: program.date,
+      startTime: program.start_time,
+      endTime: program.end_time,
+      trackingMode: program.tracking_mode,
+      totalScans: program.total_scans,
+      isActive: program.is_active,
+      giftingEnabled: program.gifting_enabled,
+      flyerType: program.flyer_type || 'standard',
+      personalizedFlyerConfig: program.personalized_flyer_config,
+      personalizedBackgroundUrl: program.personalized_background_url,
+      personalizedLogoUrl: program.personalized_logo_url,
+      flyerUrl: program.flyer_url,
+      createdAt: program.created_at
+    }))
+  };
+};
+
+const buildAttendanceOverTimePayload = async (programId, program) => {
+  const [bucketResult, rangeResult] = await Promise.all([
+    pool.query(
+      `SELECT
+        to_char(scan_time, 'HH24') || ':' ||
+        CASE
+          WHEN EXTRACT(MINUTE FROM scan_time) < 30 THEN '00'
+          ELSE '30'
+        END AS time_bucket,
+        COUNT(*) AS count
+      FROM scans
+      WHERE program_id = $1
+      GROUP BY 1
+      ORDER BY 1`,
+      [programId]
+    ),
+    pool.query(
+      `SELECT
+        to_char(MIN(scan_time), 'HH24') || ':' ||
+        CASE
+          WHEN EXTRACT(MINUTE FROM MIN(scan_time)) < 30 THEN '00'
+          ELSE '30'
+        END AS min_bucket,
+        to_char(MAX(scan_time), 'HH24') || ':' ||
+        CASE
+          WHEN EXTRACT(MINUTE FROM MAX(scan_time)) < 30 THEN '00'
+          ELSE '30'
+        END AS max_bucket
+      FROM scans
+      WHERE program_id = $1`,
+      [programId]
+    )
+  ]);
+
+  return {
+    buckets: bucketResult.rows.map(row => ({
+      time: row.time_bucket,
+      scans: parseInt(row.count, 10)
+    })),
+    startTime: formatProgramTime(program.start_time),
+    endTime: formatProgramTime(program.end_time),
+    scanRangeStart: rangeResult.rows[0].min_bucket || null,
+    scanRangeEnd: rangeResult.rows[0].max_bucket || null
+  };
+};
+
+const buildCountOnlyStatsPayload = async (programId) => {
+  const result = await pool.query(
+    `SELECT
+      COUNT(CASE WHEN gender = 'male' THEN 1 END) as male_count,
+      COUNT(CASE WHEN gender = 'female' THEN 1 END) as female_count,
+      COUNT(CASE WHEN first_timer = true THEN 1 END) as first_timer_count
+     FROM scans
+     WHERE program_id = $1`,
+    [programId]
+  );
+
+  return {
+    maleCount: parseInt(result.rows[0].male_count, 10),
+    femaleCount: parseInt(result.rows[0].female_count, 10),
+    firstTimerCount: parseInt(result.rows[0].first_timer_count, 10)
+  };
+};
+
 // Create Program
 exports.createProgram = async (req, res) => {
   try {
@@ -223,6 +510,29 @@ exports.getPrograms = async (req, res) => {
   }
 };
 
+// Get dashboard bootstrap data in one request
+exports.getDashboardBootstrap = async (req, res) => {
+  try {
+    const churchId = req.churchId;
+    const { startDate, endDate } = req.query;
+
+    const [church, unreadCount, stats] = await Promise.all([
+      getChurchProfile(churchId),
+      getUnreadCountForChurch(churchId),
+      buildDashboardStatsPayload(churchId, startDate, endDate)
+    ]);
+
+    if (!church) {
+      return res.status(404).json({ error: 'Church not found' });
+    }
+
+    return res.json({ church, unreadCount, stats });
+  } catch (error) {
+    console.error('Get dashboard bootstrap error:', error);
+    return res.status(500).json({ error: 'Server error fetching dashboard bootstrap' });
+  }
+};
+
 // Get single program details
 exports.getProgramById = async (req, res) => {
   try {
@@ -284,6 +594,77 @@ exports.getProgramById = async (req, res) => {
   } catch (error) {
     console.error('Get program error:', error);
     res.status(500).json({ error: 'Server error fetching program' });
+  }
+};
+
+// Get program detail bootstrap data in one request
+exports.getProgramDetailBootstrap = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const churchId = req.churchId;
+
+    const [church, unreadCount, programResult] = await Promise.all([
+      getChurchProfile(churchId),
+      getUnreadCountForChurch(churchId),
+      pool.query(
+        'SELECT * FROM programs WHERE id = $1 AND church_id = $2',
+        [id, churchId]
+      )
+    ]);
+
+    if (!church) {
+      return res.status(404).json({ error: 'Church not found' });
+    }
+
+    if (programResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Program not found' });
+    }
+
+    const program = programResult.rows[0];
+    const isCountOnly = program.tracking_mode === 'count-only';
+
+    const [
+      attendeesCountResult,
+      firstTimersResult,
+      winnersGiftedResult,
+      attendeesResult,
+      attendanceData,
+      countOnlyStats,
+      countOnlyScansResult
+    ] = await Promise.all([
+      pool.query('SELECT COUNT(*) FROM attendees WHERE program_id = $1', [id]),
+      pool.query('SELECT COUNT(*) FROM attendees WHERE program_id = $1 AND first_timer = true', [id]),
+      pool.query('SELECT COUNT(*) FROM attendees WHERE program_id = $1 AND is_winner = true AND is_gifted = true', [id]),
+      pool.query('SELECT * FROM attendees WHERE program_id = $1 ORDER BY scan_time DESC', [id]),
+      buildAttendanceOverTimePayload(id, program),
+      isCountOnly ? buildCountOnlyStatsPayload(id) : Promise.resolve(null),
+      isCountOnly
+        ? pool.query(
+            `SELECT id, gender, first_timer, scan_time
+             FROM scans
+             WHERE program_id = $1
+             ORDER BY scan_time DESC`,
+            [id]
+          )
+        : Promise.resolve({ rows: [] })
+    ]);
+
+    return res.json({
+      church,
+      unreadCount,
+      program: mapProgramDetail(program, {
+        attendeesCount: parseInt(attendeesCountResult.rows[0].count, 10),
+        firstTimersCount: parseInt(firstTimersResult.rows[0].count, 10),
+        winnersGifted: parseInt(winnersGiftedResult.rows[0].count, 10)
+      }),
+      attendees: attendeesResult.rows.map(mapAttendee),
+      attendanceData,
+      countOnlyStats,
+      countOnlyScans: countOnlyScansResult.rows.map(mapScan)
+    });
+  } catch (error) {
+    console.error('Get program detail bootstrap error:', error);
+    return res.status(500).json({ error: 'Server error fetching program detail bootstrap' });
   }
 };
 
