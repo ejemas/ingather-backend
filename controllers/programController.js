@@ -30,6 +30,7 @@ const mapChurch = (church) => ({
   email: church.email,
   location: church.location,
   logoUrl: church.logo_url,
+  organizationType: church.organization_type || null,
   createdAt: church.created_at
 });
 
@@ -87,7 +88,7 @@ const formatProgramTime = (time) => {
 
 const getChurchProfile = async (churchId) => {
   const result = await pool.query(
-    'SELECT id, church_name, branch_name, email, location, logo_url, created_at FROM churches WHERE id = $1',
+    'SELECT id, church_name, branch_name, email, location, logo_url, organization_type, created_at FROM churches WHERE id = $1',
     [churchId]
   );
 

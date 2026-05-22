@@ -1,6 +1,22 @@
 -- Migration: Add email verification and OTP fields to churches table
 -- Run this against your existing database
 
+-- Migration: Account setup organization type
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'churches'
+      AND column_name = 'organization_type'
+  ) THEN
+    ALTER TABLE churches ADD COLUMN IF NOT EXISTS organization_type VARCHAR(50);
+    UPDATE churches SET organization_type = 'general' WHERE organization_type IS NULL;
+  END IF;
+END;
+$$;
+
 ALTER TABLE churches ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE;
 ALTER TABLE churches ADD COLUMN IF NOT EXISTS otp_code VARCHAR(255);
 ALTER TABLE churches ALTER COLUMN otp_code TYPE VARCHAR(255);

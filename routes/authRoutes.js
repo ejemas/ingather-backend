@@ -12,6 +12,16 @@ const loginLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 12, keyG
 const otpVerifyLimiter = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 8, keyGenerator: emailKey });
 const otpSendLimiter = createRateLimiter({ windowMs: 10 * 60 * 1000, max: 4, keyGenerator: emailKey });
 const passwordResetLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 6, keyGenerator: emailKey });
+const organizationTypes = [
+  'general',
+  'techMeetup',
+  'conference',
+  'seminar',
+  'bootcamp',
+  'corporateEvent',
+  'church',
+  'communityGathering'
+];
 
 // Register
 router.post(
@@ -45,6 +55,19 @@ router.get('/me', auth, authController.getCurrentChurch);
 
 // Update church info (protected)
 router.put('/update', auth, authController.updateChurch);
+
+// Update organization type for account setup (protected)
+router.put(
+  '/organization-type',
+  auth,
+  [
+    body('organizationType')
+      .isIn(organizationTypes)
+      .withMessage('Valid organization type is required'),
+    validate
+  ],
+  authController.updateOrganizationType
+);
 
 // Change password (protected)
 router.put('/change-password', auth, authController.changePassword);

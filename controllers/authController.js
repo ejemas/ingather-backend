@@ -5,10 +5,35 @@ const pool = require('../config/database');
 const { generateOTP, sendOTPEmail, sendPasswordResetEmail } = require('../utils/emailService');
 
 const OTP_MAX_ATTEMPTS = 5;
+const VALID_ORGANIZATION_TYPES = new Set([
+  'general',
+  'techMeetup',
+  'conference',
+  'seminar',
+  'bootcamp',
+  'corporateEvent',
+  'church',
+  'communityGathering'
+]);
 
 const otpSecret = () => process.env.OTP_SECRET || process.env.JWT_SECRET || 'ingather-development-otp-secret';
 
 const normalizeEmail = (email) => String(email || '').trim().toLowerCase();
+
+const isValidOrganizationType = (organizationType) => (
+  typeof organizationType === 'string' && VALID_ORGANIZATION_TYPES.has(organizationType)
+);
+
+const mapChurchProfile = (church) => ({
+  id: church.id,
+  churchName: church.church_name,
+  branchName: church.branch_name,
+  email: church.email,
+  location: church.location,
+  logoUrl: church.logo_url,
+  organizationType: church.organization_type || null,
+  ...(church.created_at !== undefined ? { createdAt: church.created_at } : {})
+});
 
 const hashOtp = (email, otp, purpose) => {
   return crypto
@@ -66,7 +91,7 @@ exports.register = async (req, res) => {
     );
 
     if (churchExists.rows.length > 0) {
-      return res.status(400).json({ error: 'Church with this email already exists' });
+      return res.status(400).json({ error: 'Account with this email already exists' });
     }
 
     // Hash password
@@ -145,14 +170,7 @@ exports.login = async (req, res) => {
     res.json({
       message: 'Login successful',
       token,
-      church: {
-        id: church.id,
-        churchName: church.church_name,
-        branchName: church.branch_name,
-        email: church.email,
-        location: church.location,
-        logoUrl: church.logo_url
-      }
+      church: mapChurchProfile(church)
     });
   } catch (error) {
     console.error('Login error:', error);
@@ -343,7 +361,7 @@ exports.resetPassword = async (req, res) => {
 exports.getCurrentChurch = async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT id, church_name, branch_name, email, location, logo_url, created_at FROM churches WHERE id = $1',
+      'SELECT id, church_name, branch_name, email, location, logo_url, organization_type, created_at FROM churches WHERE id = $1',
       [req.churchId]
     );
 
@@ -351,17 +369,7 @@ exports.getCurrentChurch = async (req, res) => {
       return res.status(404).json({ error: 'Church not found' });
     }
 
-    const church = result.rows[0];
-
-    res.json({
-      id: church.id,
-      churchName: church.church_name,
-      branchName: church.branch_name,
-      email: church.email,
-      location: church.location,
-      logoUrl: church.logo_url,
-      createdAt: church.created_at
-    });
+    res.json(mapChurchProfile(result.rows[0]));
   } catch (error) {
     console.error('Get church error:', error);
     res.status(500).json({ error: 'Server error' });
@@ -380,7 +388,7 @@ exports.updateChurch = async (req, res) => {
         `UPDATE churches 
          SET church_name = $1, branch_name = $2, location = $3, logo_url = $4, updated_at = CURRENT_TIMESTAMP
          WHERE id = $5
-         RETURNING id, church_name, branch_name, email, location, logo_url`,
+         RETURNING id, church_name, branch_name, email, location, logo_url, organization_type`,
         [churchName, branchName, location, logoUrl, churchId]
       );
     } else {
@@ -388,7 +396,7 @@ exports.updateChurch = async (req, res) => {
         `UPDATE churches 
          SET church_name = $1, branch_name = $2, location = $3, updated_at = CURRENT_TIMESTAMP
          WHERE id = $4
-         RETURNING id, church_name, branch_name, email, location, logo_url`,
+         RETURNING id, church_name, branch_name, email, location, logo_url, organization_type`,
         [churchName, branchName, location, churchId]
       );
     }
@@ -397,22 +405,44 @@ exports.updateChurch = async (req, res) => {
       return res.status(404).json({ error: 'Church not found' });
     }
 
-    const church = result.rows[0];
-
     res.json({
-      message: 'Church information updated successfully',
-      church: {
-        id: church.id,
-        churchName: church.church_name,
-        branchName: church.branch_name,
-        email: church.email,
-        location: church.location,
-        logoUrl: church.logo_url
-      }
+      message: 'Workspace information updated successfully',
+      church: mapChurchProfile(result.rows[0])
     });
   } catch (error) {
     console.error('Update church error:', error);
     res.status(500).json({ error: 'Server error updating church information' });
+  }
+};
+
+// Update organization type for account setup and template personalization
+exports.updateOrganizationType = async (req, res) => {
+  try {
+    const { organizationType } = req.body;
+
+    if (!isValidOrganizationType(organizationType)) {
+      return res.status(400).json({ error: 'Please choose a valid organization type.' });
+    }
+
+    const result = await pool.query(
+      `UPDATE churches
+       SET organization_type = $1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2
+       RETURNING id, church_name, branch_name, email, location, logo_url, organization_type`,
+      [organizationType, req.churchId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Church not found' });
+    }
+
+    return res.json({
+      message: 'Organization type updated successfully',
+      church: mapChurchProfile(result.rows[0])
+    });
+  } catch (error) {
+    console.error('Update organization type error:', error);
+    return res.status(500).json({ error: 'Server error updating organization type' });
   }
 };
 

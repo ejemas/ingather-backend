@@ -97,8 +97,29 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 5000;
 
-// Auto-migrate: add is_gifted column if it doesn't exist
 const pool = require('./config/database');
+
+// Auto-migrate: add organization type once and backfill existing accounts
+pool.query(`
+  DO $$
+  BEGIN
+    IF NOT EXISTS (
+      SELECT 1
+      FROM information_schema.columns
+      WHERE table_schema = 'public'
+        AND table_name = 'churches'
+        AND column_name = 'organization_type'
+    ) THEN
+      ALTER TABLE churches ADD COLUMN IF NOT EXISTS organization_type VARCHAR(50);
+      UPDATE churches SET organization_type = 'general' WHERE organization_type IS NULL;
+    END IF;
+  END;
+  $$;
+`)
+  .then(() => console.log('Migration check: organization type column ready'))
+  .catch(err => console.error('Migration warning (organization type):', err.message));
+
+// Auto-migrate: add is_gifted column if it doesn't exist
 pool.query(`ALTER TABLE attendees ADD COLUMN IF NOT EXISTS is_gifted BOOLEAN DEFAULT FALSE`)
   .then(() => console.log('✅ Migration check: is_gifted column ready'))
   .catch(err => console.error('Migration warning:', err.message));
