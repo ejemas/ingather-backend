@@ -33,6 +33,10 @@ router.post(
     body('email').isEmail().withMessage('Valid email is required'),
     body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
     body('location').notEmpty().withMessage('Location is required'),
+    body('organizationType')
+      .optional({ nullable: true })
+      .isIn(organizationTypes)
+      .withMessage('Valid organization type is required'),
     validate
   ],
   authController.register

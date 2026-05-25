@@ -81,8 +81,9 @@ const incrementOtpAttempts = (email) => {
 // Register Church
 exports.register = async (req, res) => {
   try {
-    const { churchName, branchName, email, password, location, logoUrl } = req.body;
+    const { churchName, branchName, email, password, location, logoUrl, organizationType } = req.body;
     const normalizedEmail = normalizeEmail(email);
+    const selectedOrganizationType = isValidOrganizationType(organizationType) ? organizationType : null;
 
     // Check if church already exists
     const churchExists = await pool.query(
@@ -105,10 +106,10 @@ exports.register = async (req, res) => {
 
     // Insert church with OTP
     const result = await pool.query(
-      `INSERT INTO churches (church_name, branch_name, email, password, location, logo_url, is_verified, otp_code, otp_expires_at, otp_attempts, otp_purpose) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, $10) 
-       RETURNING id, church_name, branch_name, email, location`,
-      [churchName, branchName, normalizedEmail, hashedPassword, location, logoUrl || null, false, hashedOtp, otpExpiresAt, 'verify']
+      `INSERT INTO churches (church_name, branch_name, email, password, location, logo_url, organization_type, is_verified, otp_code, otp_expires_at, otp_attempts, otp_purpose) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11) 
+       RETURNING id, church_name, branch_name, email, location, organization_type`,
+      [churchName, branchName, normalizedEmail, hashedPassword, location, logoUrl || null, selectedOrganizationType, false, hashedOtp, otpExpiresAt, 'verify']
     );
 
     // Send OTP email
@@ -118,7 +119,8 @@ exports.register = async (req, res) => {
     res.status(201).json({
       message: 'Registration successful. Please verify your email.',
       requiresVerification: true,
-      email: result.rows[0].email
+      email: result.rows[0].email,
+      organizationType: result.rows[0].organization_type || null
     });
   } catch (error) {
     console.error('Register error:', error);
