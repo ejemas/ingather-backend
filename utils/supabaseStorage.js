@@ -58,11 +58,20 @@ const getExtension = (mimeType) => {
   return 'jpg';
 };
 
-const uploadEventFlyer = async ({ churchId, dataUrl }) => {
+const normalizeStorageFolder = (folder) => (
+  String(folder || '')
+    .trim()
+    .replace(/^\/+|\/+$/g, '')
+    .replace(/[^a-zA-Z0-9/_-]/g, '-')
+);
+
+const uploadEventFlyer = async ({ churchId, dataUrl, folder = '' }) => {
   const { supabaseUrl, serviceRoleKey, bucket } = getStorageConfig();
   const { buffer, mimeType } = parseDataUrl(dataUrl);
   const extension = getExtension(mimeType);
-  const storagePath = `church-${churchId}/${Date.now()}-${crypto.randomUUID()}.${extension}`;
+  const folderPrefix = normalizeStorageFolder(folder);
+  const scopedFolder = folderPrefix ? `${folderPrefix}/` : '';
+  const storagePath = `church-${churchId}/${scopedFolder}${Date.now()}-${crypto.randomUUID()}.${extension}`;
   const encodedPath = encodeStoragePath(storagePath);
   const uploadUrl = `${supabaseUrl}/storage/v1/object/${bucket}/${encodedPath}`;
 

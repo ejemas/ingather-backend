@@ -23,6 +23,100 @@ const normalizePersonalizedFlyerConfig = (config = {}) => {
   };
 };
 
+const normalizeSponsorDisplayMode = (mode) => (
+  mode === 'distribution' ? 'distribution' : 'carousel'
+);
+
+const cleanOptionalText = (value, maxLength = 255) => {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  return trimmed.slice(0, maxLength);
+};
+
+const cleanRequiredText = (value, label, maxLength = 255) => {
+  const cleaned = cleanOptionalText(value, maxLength);
+  if (!cleaned) {
+    throw new Error(`${label} is required`);
+  }
+  return cleaned;
+};
+
+const normalizeSponsorUrl = (value) => {
+  const cleaned = cleanRequiredText(value, 'Sponsor CTA link', 1000);
+  try {
+    const url = new URL(cleaned);
+    if (!['http:', 'https:'].includes(url.protocol)) {
+      throw new Error('Invalid sponsor CTA link');
+    }
+    return url.toString();
+  } catch (error) {
+    throw new Error('Sponsor CTA link must be a valid http or https URL');
+  }
+};
+
+const normalizeSponsors = (sponsors = [], displayMode = 'carousel') => {
+  if (!Array.isArray(sponsors)) {
+    throw new Error('Sponsors must be an array');
+  }
+
+  const normalized = sponsors
+    .filter(sponsor => sponsor && typeof sponsor === 'object')
+    .map((sponsor, index) => {
+      const percentage = sponsor.distributionPercentage === '' || sponsor.distributionPercentage === null || sponsor.distributionPercentage === undefined
+        ? null
+        : Number(sponsor.distributionPercentage);
+
+      if (displayMode === 'distribution' && (!Number.isInteger(percentage) || percentage < 1 || percentage > 100)) {
+        throw new Error('Each distribution sponsor must have a percentage between 1 and 100');
+      }
+
+      if (!sponsor.flyer?.dataUrl) {
+        throw new Error('Each sponsor needs a flyer image');
+      }
+
+      return {
+        sponsorName: cleanRequiredText(sponsor.sponsorName, 'Sponsor name'),
+        ctaText: cleanRequiredText(sponsor.ctaText || 'Learn More', 'Sponsor CTA text', 80),
+        ctaLink: normalizeSponsorUrl(sponsor.ctaLink),
+        boothText: cleanOptionalText(sponsor.boothText, 160),
+        campaignTag: cleanOptionalText(sponsor.campaignTag, 160),
+        tier: displayMode === 'carousel' ? cleanOptionalText(sponsor.tier, 120) : null,
+        distributionPercentage: displayMode === 'distribution' ? percentage : null,
+        displayOrder: index,
+        flyer: sponsor.flyer
+      };
+    });
+
+  if (normalized.length > 12) {
+    throw new Error('You can add up to 12 sponsors per program');
+  }
+
+  if (displayMode === 'distribution' && normalized.length > 0) {
+    const total = normalized.reduce((sum, sponsor) => sum + sponsor.distributionPercentage, 0);
+    if (total !== 100) {
+      throw new Error('Sponsor distribution percentages must add up to exactly 100');
+    }
+  }
+
+  return normalized;
+};
+
+const mapSponsor = (sponsor) => ({
+  id: sponsor.id,
+  programId: sponsor.program_id,
+  sponsorName: sponsor.sponsor_name,
+  flyerUrl: sponsor.flyer_url,
+  ctaText: sponsor.cta_text,
+  ctaLink: sponsor.cta_link,
+  boothText: sponsor.booth_text,
+  campaignTag: sponsor.campaign_tag,
+  tier: sponsor.tier,
+  distributionPercentage: sponsor.distribution_percentage,
+  clickCount: parseInt(sponsor.click_count || 0, 10),
+  displayOrder: sponsor.display_order
+});
+
 const mapChurch = (church) => ({
   id: church.id,
   churchName: church.church_name,
@@ -51,6 +145,8 @@ const mapProgramDetail = (program, counts = {}) => ({
   personalizedBackgroundUrl: program.personalized_background_url,
   personalizedLogoUrl: program.personalized_logo_url,
   flyerUrl: program.flyer_url,
+  sponsorDisplayMode: program.sponsor_display_mode || 'carousel',
+  sponsorExpectedAttendees: program.sponsor_expected_attendees,
   qrCodeUrl: program.qr_code_url,
   isActive: program.is_active,
   totalScans: program.total_scans,
@@ -242,6 +338,8 @@ const buildDashboardStatsPayload = async (churchId, startDate, endDate) => {
       personalizedBackgroundUrl: program.personalized_background_url,
       personalizedLogoUrl: program.personalized_logo_url,
       flyerUrl: program.flyer_url,
+      sponsorDisplayMode: program.sponsor_display_mode || 'carousel',
+      sponsorExpectedAttendees: program.sponsor_expected_attendees,
       createdAt: program.created_at
     }))
   };
@@ -327,17 +425,32 @@ exports.createProgram = async (req, res) => {
       flyerType: requestedFlyerType,
       personalizedFlyerConfig,
       personalizedBackground,
-      personalizedLogo
+      personalizedLogo,
+      sponsorDisplayMode: requestedSponsorDisplayMode,
+      sponsorExpectedAttendees,
+      sponsors: requestedSponsors
     } = req.body;
 
     const churchId = req.churchId;
     const flyerType = normalizeFlyerType(requestedFlyerType);
+    const sponsorDisplayMode = normalizeSponsorDisplayMode(requestedSponsorDisplayMode);
+    const normalizedSponsors = normalizeSponsors(requestedSponsors || [], sponsorDisplayMode);
+    const normalizedSponsorExpectedAttendees = sponsorDisplayMode === 'distribution' && sponsorExpectedAttendees !== '' && sponsorExpectedAttendees !== null && sponsorExpectedAttendees !== undefined
+      ? Number(sponsorExpectedAttendees)
+      : null;
     const resolvedDataFields = { ...(dataFields || {}) };
     const resolvedTrackingMode = flyerType === 'personalized' ? 'collect-data' : trackingMode;
     const resolvedPersonalizedConfig = normalizePersonalizedFlyerConfig(personalizedFlyerConfig);
     let uploadedFlyer = null;
     let uploadedPersonalizedBackground = null;
     let uploadedPersonalizedLogo = null;
+    const uploadedSponsors = [];
+
+    if (sponsorDisplayMode === 'distribution' && normalizedSponsors.length > 0) {
+      if (!Number.isInteger(normalizedSponsorExpectedAttendees) || normalizedSponsorExpectedAttendees < 1) {
+        return res.status(400).json({ error: 'Expected attendees is required for percentage distribution sponsors' });
+      }
+    }
 
     if (flyerType === 'personalized') {
       resolvedDataFields.fullName = true;
@@ -368,6 +481,21 @@ exports.createProgram = async (req, res) => {
       });
     }
 
+    for (const sponsor of normalizedSponsors) {
+      const uploadedSponsorFlyer = await uploadEventFlyer({
+        churchId,
+        dataUrl: sponsor.flyer.dataUrl,
+        folder: 'sponsors'
+      });
+
+      uploadedSponsors.push({
+        ...sponsor,
+        flyerUrl: uploadedSponsorFlyer.flyerUrl,
+        flyerStoragePath: uploadedSponsorFlyer.flyerStoragePath,
+        flyerOriginalName: sponsor.flyer.originalName || null
+      });
+    }
+
     const personalizedConfigForStorage = flyerType === 'personalized'
       ? {
           ...resolvedPersonalizedConfig,
@@ -376,13 +504,18 @@ exports.createProgram = async (req, res) => {
         }
       : null;
 
-    // Insert program
+    // Insert program and sponsors atomically.
     let result;
+    const client = await pool.connect();
+    let transactionStarted = false;
     try {
-      result = await pool.query(
+      await client.query('BEGIN');
+      transactionStarted = true;
+
+      result = await client.query(
         `INSERT INTO programs 
-         (church_id, title, date, start_time, end_time, tracking_mode, data_fields, gifting_enabled, total_winners, flyer_type, flyer_url, flyer_storage_path, flyer_original_name, personalized_flyer_config, personalized_background_url, personalized_background_storage_path, personalized_background_original_name, personalized_logo_url, personalized_logo_storage_path, personalized_logo_original_name) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) 
+         (church_id, title, date, start_time, end_time, tracking_mode, data_fields, gifting_enabled, total_winners, flyer_type, flyer_url, flyer_storage_path, flyer_original_name, personalized_flyer_config, personalized_background_url, personalized_background_storage_path, personalized_background_original_name, personalized_logo_url, personalized_logo_storage_path, personalized_logo_original_name, sponsor_display_mode, sponsor_expected_attendees) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22) 
          RETURNING *`,
         [
           churchId,
@@ -404,10 +537,51 @@ exports.createProgram = async (req, res) => {
           personalizedBackground?.originalName || null,
           uploadedPersonalizedLogo?.flyerUrl || null,
           uploadedPersonalizedLogo?.flyerStoragePath || null,
-          personalizedLogo?.originalName || null
+          personalizedLogo?.originalName || null,
+          sponsorDisplayMode,
+          normalizedSponsorExpectedAttendees
         ]
       );
+
+      const program = result.rows[0];
+
+      for (const sponsor of uploadedSponsors) {
+        await client.query(
+          `INSERT INTO event_sponsors
+           (program_id, sponsor_name, flyer_url, flyer_storage_path, flyer_original_name, cta_text, cta_link, booth_text, campaign_tag, tier, distribution_percentage, display_order)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+          [
+            program.id,
+            sponsor.sponsorName,
+            sponsor.flyerUrl,
+            sponsor.flyerStoragePath,
+            sponsor.flyerOriginalName,
+            sponsor.ctaText,
+            sponsor.ctaLink,
+            sponsor.boothText,
+            sponsor.campaignTag,
+            sponsor.tier,
+            sponsor.distributionPercentage,
+            sponsor.displayOrder
+          ]
+        );
+      }
+
+      // Generate QR Code URL
+      const qrCodeUrl = `${process.env.FRONTEND_URL}/scan/${program.id}`;
+
+      // Update program with QR code URL
+      await client.query(
+        'UPDATE programs SET qr_code_url = $1 WHERE id = $2',
+        [qrCodeUrl, program.id]
+      );
+
+      await client.query('COMMIT');
+      transactionStarted = false;
     } catch (error) {
+      if (transactionStarted) {
+        await client.query('ROLLBACK');
+      }
       if (uploadedFlyer?.flyerStoragePath) {
         deleteEventFlyer(uploadedFlyer.flyerStoragePath).catch(deleteError => {
           console.error('Flyer cleanup warning:', deleteError.message);
@@ -423,19 +597,21 @@ exports.createProgram = async (req, res) => {
           console.error('Personalized logo cleanup warning:', deleteError.message);
         });
       }
+      uploadedSponsors.forEach(sponsor => {
+        if (sponsor.flyerStoragePath) {
+          deleteEventFlyer(sponsor.flyerStoragePath).catch(deleteError => {
+            console.error('Sponsor flyer cleanup warning:', deleteError.message);
+          });
+        }
+      });
       throw error;
+    } finally {
+      client.release();
     }
 
     const program = result.rows[0];
 
-    // Generate QR Code URL
     const qrCodeUrl = `${process.env.FRONTEND_URL}/scan/${program.id}`;
-
-    // Update program with QR code URL
-    await pool.query(
-      'UPDATE programs SET qr_code_url = $1 WHERE id = $2',
-      [qrCodeUrl, program.id]
-    );
 
     // Generate QR code image as base64
     const qrCodeImage = await QRCode.toDataURL(qrCodeUrl);
@@ -457,6 +633,19 @@ exports.createProgram = async (req, res) => {
         personalizedBackgroundUrl: program.personalized_background_url,
         personalizedLogoUrl: program.personalized_logo_url,
         flyerUrl: program.flyer_url,
+        sponsorDisplayMode: program.sponsor_display_mode,
+        sponsorExpectedAttendees: program.sponsor_expected_attendees,
+        sponsors: uploadedSponsors.map((sponsor, index) => ({
+          id: index,
+          sponsorName: sponsor.sponsorName,
+          flyerUrl: sponsor.flyerUrl,
+          ctaText: sponsor.ctaText,
+          ctaLink: sponsor.ctaLink,
+          boothText: sponsor.boothText,
+          campaignTag: sponsor.campaignTag,
+          tier: sponsor.tier,
+          distributionPercentage: sponsor.distributionPercentage
+        })),
         qrCodeUrl: qrCodeUrl,
         qrCodeImage: qrCodeImage,
         isActive: program.is_active,
@@ -465,7 +654,7 @@ exports.createProgram = async (req, res) => {
     });
   } catch (error) {
     console.error('Create program error:', error);
-    const isFlyerError = error.message?.includes('flyer') || error.message?.includes('Flyer') || error.message?.includes('Supabase');
+    const isFlyerError = error.message?.includes('flyer') || error.message?.includes('Flyer') || error.message?.includes('Supabase') || error.message?.includes('Sponsor') || error.message?.includes('sponsor') || error.message?.includes('distribution');
     res.status(isFlyerError ? 400 : 500).json({
       error: isFlyerError ? error.message : 'Server error creating program'
     });
@@ -498,6 +687,8 @@ exports.getPrograms = async (req, res) => {
       personalizedBackgroundUrl: program.personalized_background_url,
       personalizedLogoUrl: program.personalized_logo_url,
       flyerUrl: program.flyer_url,
+      sponsorDisplayMode: program.sponsor_display_mode || 'carousel',
+      sponsorExpectedAttendees: program.sponsor_expected_attendees,
       qrCodeUrl: program.qr_code_url,
       isActive: program.is_active,
       totalScans: program.total_scans,
@@ -586,6 +777,8 @@ exports.getProgramById = async (req, res) => {
       personalizedBackgroundUrl: program.personalized_background_url,
       personalizedLogoUrl: program.personalized_logo_url,
       flyerUrl: program.flyer_url,
+      sponsorDisplayMode: program.sponsor_display_mode || 'carousel',
+      sponsorExpectedAttendees: program.sponsor_expected_attendees,
       qrCodeUrl: program.qr_code_url,
       isActive: program.is_active,
       totalScans: program.total_scans,
@@ -910,6 +1103,55 @@ exports.markWinnerGifted = async (req, res) => {
   }
 };
 
+// Get sponsor engagement analytics for a program
+exports.getSponsorAnalytics = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const churchId = req.churchId;
+
+    const programCheck = await pool.query(
+      'SELECT id FROM programs WHERE id = $1 AND church_id = $2',
+      [id, churchId]
+    );
+
+    if (programCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Program not found' });
+    }
+
+    const sponsorsResult = await pool.query(
+      `SELECT
+        s.*,
+        COUNT(ce.id) FILTER (WHERE ce.clicked_at::date = CURRENT_DATE) AS today_clicks
+       FROM event_sponsors s
+       LEFT JOIN sponsor_click_events ce ON ce.sponsor_id = s.id
+       WHERE s.program_id = $1 AND s.is_active = true
+       GROUP BY s.id
+       ORDER BY s.click_count DESC, s.display_order ASC`,
+      [id]
+    );
+
+    const sponsors = sponsorsResult.rows.map(row => ({
+      ...mapSponsor(row),
+      todayClicks: parseInt(row.today_clicks || 0, 10)
+    }));
+
+    const totalClicks = sponsors.reduce((sum, sponsor) => sum + sponsor.clickCount, 0);
+    const todayClicks = sponsors.reduce((sum, sponsor) => sum + sponsor.todayClicks, 0);
+    const topSponsor = sponsors.length > 0 ? sponsors[0] : null;
+
+    return res.json({
+      sponsorCount: sponsors.length,
+      totalClicks,
+      todayClicks,
+      topSponsor,
+      sponsors
+    });
+  } catch (error) {
+    console.error('Get sponsor analytics error:', error);
+    return res.status(500).json({ error: 'Server error fetching sponsor analytics' });
+  }
+};
+
 // Get dashboard statistics with date-range filtering
 exports.getDashboardStats = async (req, res) => {
   try {
@@ -1061,6 +1303,8 @@ exports.getDashboardStats = async (req, res) => {
       personalizedBackgroundUrl: program.personalized_background_url,
       personalizedLogoUrl: program.personalized_logo_url,
       flyerUrl: program.flyer_url,
+      sponsorDisplayMode: program.sponsor_display_mode || 'carousel',
+      sponsorExpectedAttendees: program.sponsor_expected_attendees,
       createdAt: program.created_at
     }));
 

@@ -16,6 +16,7 @@ router.post(
     body('endTime').notEmpty().withMessage('End time is required'),
     body('trackingMode').isIn(['count-only', 'collect-data']).withMessage('Invalid tracking mode'),
     body('flyerType').optional().isIn(['standard', 'personalized']).withMessage('Invalid flyer type'),
+    body('sponsorDisplayMode').optional().isIn(['carousel', 'distribution']).withMessage('Invalid sponsor display mode'),
     validate
   ],
   programController.createProgram
@@ -32,6 +33,9 @@ router.get('/dashboard-bootstrap', auth, programController.getDashboardBootstrap
 
 // Get program detail bootstrap data (protected)
 router.get('/:id/detail-bootstrap', auth, programController.getProgramDetailBootstrap);
+
+// Get sponsor engagement analytics (protected)
+router.get('/:id/sponsor-analytics', auth, programController.getSponsorAnalytics);
 
 // Get single program (protected)
 router.get('/:id', auth, programController.getProgramById);

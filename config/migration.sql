@@ -60,6 +60,62 @@ ALTER TABLE programs ADD COLUMN IF NOT EXISTS flyer_url TEXT;
 ALTER TABLE programs ADD COLUMN IF NOT EXISTS flyer_storage_path TEXT;
 ALTER TABLE programs ADD COLUMN IF NOT EXISTS flyer_original_name VARCHAR(255);
 
+-- Migration: Event sponsor flyers and sponsor engagement analytics
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+ALTER TABLE programs ADD COLUMN IF NOT EXISTS sponsor_display_mode TEXT NOT NULL DEFAULT 'carousel';
+ALTER TABLE programs ADD COLUMN IF NOT EXISTS sponsor_expected_attendees INTEGER;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'programs_sponsor_display_mode_check'
+  ) THEN
+    ALTER TABLE programs
+    ADD CONSTRAINT programs_sponsor_display_mode_check
+    CHECK (sponsor_display_mode IN ('carousel', 'distribution'));
+  END IF;
+END;
+$$;
+
+CREATE TABLE IF NOT EXISTS event_sponsors (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    program_id INTEGER NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
+    sponsor_name TEXT NOT NULL,
+    flyer_url TEXT NOT NULL,
+    flyer_storage_path TEXT,
+    flyer_original_name TEXT,
+    cta_text TEXT NOT NULL,
+    cta_link TEXT NOT NULL,
+    booth_text TEXT,
+    campaign_tag TEXT,
+    tier TEXT,
+    distribution_percentage INTEGER,
+    click_count INTEGER NOT NULL DEFAULT 0,
+    display_order INTEGER NOT NULL DEFAULT 0,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT event_sponsors_distribution_percentage_check
+      CHECK (distribution_percentage IS NULL OR distribution_percentage BETWEEN 1 AND 100),
+    CONSTRAINT event_sponsors_cta_link_check
+      CHECK (cta_link ~* '^https?://')
+);
+
+CREATE TABLE IF NOT EXISTS sponsor_click_events (
+    id BIGSERIAL PRIMARY KEY,
+    sponsor_id UUID NOT NULL REFERENCES event_sponsors(id) ON DELETE CASCADE,
+    program_id INTEGER NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
+    campaign_tag TEXT,
+    device_fingerprint_hash TEXT,
+    clicked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_sponsors_program_id ON event_sponsors(program_id);
+CREATE INDEX IF NOT EXISTS idx_event_sponsors_program_active ON event_sponsors(program_id, is_active, display_order);
+CREATE INDEX IF NOT EXISTS idx_sponsor_click_events_program_time ON sponsor_click_events(program_id, clicked_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sponsor_click_events_sponsor_time ON sponsor_click_events(sponsor_id, clicked_at DESC);
+
 -- Migration: Scan session tokens for public scan follow-up mutations
 ALTER TABLE scans ADD COLUMN IF NOT EXISTS scan_token_hash VARCHAR(128);
 ALTER TABLE scans ADD COLUMN IF NOT EXISTS scan_token_expires_at TIMESTAMP;

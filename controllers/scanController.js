@@ -86,6 +86,84 @@ const getCountStats = async (programId) => {
   };
 };
 
+const mapSponsor = (sponsor) => ({
+  id: sponsor.id,
+  sponsorName: sponsor.sponsor_name,
+  flyerUrl: sponsor.flyer_url,
+  ctaText: sponsor.cta_text,
+  ctaLink: sponsor.cta_link,
+  boothText: sponsor.booth_text,
+  campaignTag: sponsor.campaign_tag,
+  tier: sponsor.tier,
+  distributionPercentage: sponsor.distribution_percentage,
+  clickCount: parseInt(sponsor.click_count || 0, 10),
+  displayOrder: sponsor.display_order
+});
+
+const getSponsorsForProgram = async (programId) => {
+  const result = await pool.query(
+    `SELECT *
+     FROM event_sponsors
+     WHERE program_id = $1 AND is_active = true
+     ORDER BY
+       CASE WHEN tier IS NULL OR tier = '' THEN 1 ELSE 0 END,
+       tier ASC,
+       display_order ASC,
+       created_at ASC`,
+    [programId]
+  );
+
+  return result.rows.map(mapSponsor);
+};
+
+const hashToPercentageBucket = (programId, deviceFingerprint) => {
+  const hash = crypto
+    .createHash('sha256')
+    .update(`${programId}:${deviceFingerprint || crypto.randomUUID()}`)
+    .digest('hex');
+  const value = parseInt(hash.slice(0, 8), 16);
+  return (value / 0xffffffff) * 100;
+};
+
+const selectDistributedSponsor = (programId, deviceFingerprint, sponsors) => {
+  if (sponsors.length === 0) return null;
+
+  const bucket = hashToPercentageBucket(programId, deviceFingerprint);
+  let cursor = 0;
+
+  for (const sponsor of sponsors) {
+    cursor += Number(sponsor.distributionPercentage || 0);
+    if (bucket < cursor) return sponsor;
+  }
+
+  return sponsors[sponsors.length - 1];
+};
+
+const buildSponsorPlacement = async (programId, sponsorDisplayMode, deviceFingerprint) => {
+  const sponsors = await getSponsorsForProgram(programId);
+  if (sponsors.length === 0) return null;
+
+  if (sponsorDisplayMode === 'distribution') {
+    return {
+      mode: 'distribution',
+      sponsor: selectDistributedSponsor(programId, deviceFingerprint, sponsors)
+    };
+  }
+
+  return {
+    mode: 'carousel',
+    sponsors
+  };
+};
+
+const hashDeviceFingerprintForAnalytics = (fingerprint) => {
+  if (!fingerprint) return null;
+  return crypto
+    .createHmac('sha256', scanTokenSecret())
+    .update(String(fingerprint))
+    .digest('hex');
+};
+
 // Handle QR scan
 exports.scanQR = async (req, res) => {
   const client = await pool.connect();
@@ -103,7 +181,7 @@ exports.scanQR = async (req, res) => {
     transactionStarted = true;
 
     const programResult = await client.query(
-      'SELECT id, tracking_mode, is_active FROM programs WHERE id = $1',
+      'SELECT id, tracking_mode, is_active, sponsor_display_mode FROM programs WHERE id = $1',
       [programId]
     );
 
@@ -156,6 +234,7 @@ exports.scanQR = async (req, res) => {
     transactionStarted = false;
 
     const totalScans = updatedProgram.rows[0].total_scans;
+    const sponsorPlacement = await buildSponsorPlacement(programId, program.sponsor_display_mode || 'carousel', deviceFingerprint);
     res.json({
       success: true,
       trackingMode: program.tracking_mode,
@@ -163,7 +242,8 @@ exports.scanQR = async (req, res) => {
       firstScan: true,
       isFirstTimer: req.body.firstTimer || false,
       scanSessionToken,
-      scanSessionExpiresAt: tokenExpiresAt
+      scanSessionExpiresAt: tokenExpiresAt,
+      sponsorPlacement
     });
 
     setImmediate(async () => {
@@ -235,6 +315,7 @@ exports.getProgramInfo = async (req, res) => {
       personalizedBackgroundUrl: program.personalized_background_url,
       personalizedLogoUrl: program.personalized_logo_url,
       flyerUrl: program.flyer_url,
+      sponsorDisplayMode: program.sponsor_display_mode || 'carousel',
       isActive: program.is_active
     });
   } catch (error) {
@@ -339,10 +420,13 @@ exports.submitFormData = async (req, res) => {
       timestamp: new Date()
     });
 
+    const sponsorPlacement = await buildSponsorPlacement(programId, program.sponsor_display_mode || 'carousel', session.deviceFingerprint);
+
     return res.json({
       success: true,
       isWinner,
-      giftingEnabled: program.gifting_enabled
+      giftingEnabled: program.gifting_enabled,
+      sponsorPlacement
     });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -393,6 +477,58 @@ exports.updateScanData = async (req, res) => {
   } catch (error) {
     console.error('Update scan error:', error);
     return res.status(500).json({ error: 'Server error updating scan data' });
+  } finally {
+    client.release();
+  }
+};
+
+// Track a sponsor click from the public post-check-in experience
+exports.trackSponsorClick = async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const { sponsorId } = req.params;
+    const { deviceFingerprint } = req.body || {};
+
+    await client.query('BEGIN');
+
+    const sponsorResult = await client.query(
+      `UPDATE event_sponsors
+       SET click_count = click_count + 1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1 AND is_active = true
+       RETURNING id, program_id, campaign_tag, click_count`,
+      [sponsorId]
+    );
+
+    if (sponsorResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Sponsor not found' });
+    }
+
+    const sponsor = sponsorResult.rows[0];
+
+    await client.query(
+      `INSERT INTO sponsor_click_events
+       (sponsor_id, program_id, campaign_tag, device_fingerprint_hash)
+       VALUES ($1, $2, $3, $4)`,
+      [
+        sponsor.id,
+        sponsor.program_id,
+        sponsor.campaign_tag,
+        hashDeviceFingerprintForAnalytics(deviceFingerprint)
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    return res.json({
+      success: true,
+      clickCount: parseInt(sponsor.click_count, 10)
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Track sponsor click error:', error);
+    return res.status(500).json({ error: 'Server error tracking sponsor click' });
   } finally {
     client.release();
   }

@@ -41,11 +41,50 @@ CREATE TABLE IF NOT EXISTS programs (
     personalized_logo_url TEXT,
     personalized_logo_storage_path TEXT,
     personalized_logo_original_name VARCHAR(255),
+    sponsor_display_mode TEXT DEFAULT 'carousel' CHECK (sponsor_display_mode IN ('carousel', 'distribution')),
+    sponsor_expected_attendees INTEGER,
     qr_code_url VARCHAR(500),
     is_active BOOLEAN DEFAULT TRUE,
     total_scans INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- Event Sponsors Table
+CREATE TABLE IF NOT EXISTS event_sponsors (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    program_id INTEGER NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
+    sponsor_name TEXT NOT NULL,
+    flyer_url TEXT NOT NULL,
+    flyer_storage_path TEXT,
+    flyer_original_name TEXT,
+    cta_text TEXT NOT NULL,
+    cta_link TEXT NOT NULL,
+    booth_text TEXT,
+    campaign_tag TEXT,
+    tier TEXT,
+    distribution_percentage INTEGER,
+    click_count INTEGER NOT NULL DEFAULT 0,
+    display_order INTEGER NOT NULL DEFAULT 0,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT event_sponsors_distribution_percentage_check
+      CHECK (distribution_percentage IS NULL OR distribution_percentage BETWEEN 1 AND 100),
+    CONSTRAINT event_sponsors_cta_link_check
+      CHECK (cta_link ~* '^https?://')
+);
+
+-- Sponsor click events power date-based ROI analytics.
+CREATE TABLE IF NOT EXISTS sponsor_click_events (
+    id BIGSERIAL PRIMARY KEY,
+    sponsor_id UUID NOT NULL REFERENCES event_sponsors(id) ON DELETE CASCADE,
+    program_id INTEGER NOT NULL REFERENCES programs(id) ON DELETE CASCADE,
+    campaign_tag TEXT,
+    device_fingerprint_hash TEXT,
+    clicked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Attendees Table
@@ -88,3 +127,7 @@ CREATE INDEX idx_scans_program_id ON scans(program_id);
 CREATE INDEX idx_scans_device ON scans(device_fingerprint);
 CREATE INDEX idx_programs_date ON programs(church_id, date);
 CREATE INDEX idx_scans_time ON scans(program_id, scan_time);
+CREATE INDEX IF NOT EXISTS idx_event_sponsors_program_id ON event_sponsors(program_id);
+CREATE INDEX IF NOT EXISTS idx_event_sponsors_program_active ON event_sponsors(program_id, is_active, display_order);
+CREATE INDEX IF NOT EXISTS idx_sponsor_click_events_program_time ON sponsor_click_events(program_id, clicked_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sponsor_click_events_sponsor_time ON sponsor_click_events(sponsor_id, clicked_at DESC);

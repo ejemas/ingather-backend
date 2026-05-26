@@ -19,6 +19,9 @@ router.post('/program/:programId/form', scanWriteLimiter, scanController.submitF
 // Update scan data (public)
 router.put('/program/:programId/update-scan', scanWriteLimiter, scanController.updateScanData);
 
+// Track sponsor CTA/flyer clicks (public)
+router.post('/sponsors/:sponsorId/click', scanWriteLimiter, scanController.trackSponsorClick);
+
 // Get scan records for a program (authenticated)
 router.get('/program/:programId/scans', auth, scanController.getScansForProgram);
 
