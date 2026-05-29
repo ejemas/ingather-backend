@@ -17,6 +17,7 @@ router.post(
     body('trackingMode').isIn(['count-only', 'collect-data']).withMessage('Invalid tracking mode'),
     body('flyerType').optional().isIn(['standard', 'personalized']).withMessage('Invalid flyer type'),
     body('sponsorDisplayMode').optional().isIn(['carousel', 'distribution']).withMessage('Invalid sponsor display mode'),
+    body('strictDeviceFingerprinting').optional().isBoolean().withMessage('Invalid strict device fingerprinting value'),
     validate
   ],
   programController.createProgram
@@ -40,11 +41,33 @@ router.get('/:id/sponsor-analytics', auth, programController.getSponsorAnalytics
 // Get single program (protected)
 router.get('/:id', auth, programController.getProgramById);
 
+// Update strict device fingerprinting setting (protected)
+router.put(
+  '/:id/strict-device-fingerprinting',
+  auth,
+  [
+    body('strictDeviceFingerprinting').isBoolean().withMessage('Strict device fingerprinting value is required'),
+    validate
+  ],
+  programController.updateStrictDeviceFingerprinting
+);
+
 // Stop program (protected)
 router.put('/:id/stop', auth, programController.stopProgram);
 
 // Get attendees (protected)
 router.get('/:id/attendees', auth, programController.getAttendees);
+
+// Manually add attendee/check-in (protected)
+router.post(
+  '/:id/attendees/manual',
+  auth,
+  [
+    body('formData').isObject().withMessage('Attendee data is required'),
+    validate
+  ],
+  programController.addManualAttendee
+);
 
 // Get attendance over time (protected)
 router.get('/:id/attendance-data', auth, programController.getAttendanceOverTime);

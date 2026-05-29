@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS programs (
     personalized_logo_original_name VARCHAR(255),
     sponsor_display_mode TEXT DEFAULT 'carousel' CHECK (sponsor_display_mode IN ('carousel', 'distribution')),
     sponsor_expected_attendees INTEGER,
+    proxy_checkin_enabled BOOLEAN DEFAULT FALSE,
+    strict_device_fingerprinting BOOLEAN DEFAULT TRUE,
     qr_code_url VARCHAR(500),
     is_active BOOLEAN DEFAULT TRUE,
     total_scans INTEGER DEFAULT 0,
@@ -102,6 +104,8 @@ CREATE TABLE IF NOT EXISTS attendees (
     is_winner BOOLEAN DEFAULT FALSE,
     is_gifted BOOLEAN DEFAULT FALSE,
     device_fingerprint VARCHAR(500) NOT NULL,
+    proxy_host_fingerprint VARCHAR(500),
+    scan_id INTEGER,
     scan_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -114,17 +118,41 @@ CREATE TABLE IF NOT EXISTS scans (
     first_timer BOOLEAN DEFAULT FALSE,
     scan_token_hash VARCHAR(128),
     scan_token_expires_at TIMESTAMP,
-    scan_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(program_id, device_fingerprint)
+    proxy_host_fingerprint VARCHAR(500),
+    scan_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+ALTER TABLE programs ADD COLUMN IF NOT EXISTS strict_device_fingerprinting BOOLEAN DEFAULT TRUE;
+ALTER TABLE programs ALTER COLUMN strict_device_fingerprinting SET DEFAULT TRUE;
+UPDATE programs SET strict_device_fingerprinting = TRUE WHERE strict_device_fingerprinting IS NULL;
+ALTER TABLE programs ALTER COLUMN strict_device_fingerprinting SET NOT NULL;
+ALTER TABLE attendees ADD COLUMN IF NOT EXISTS scan_id INTEGER;
+ALTER TABLE scans DROP CONSTRAINT IF EXISTS scans_program_id_device_fingerprint_key;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'attendees_scan_id_fkey'
+    ) THEN
+        ALTER TABLE attendees
+            ADD CONSTRAINT attendees_scan_id_fkey
+            FOREIGN KEY (scan_id) REFERENCES scans(id) ON DELETE SET NULL;
+    END IF;
+END $$;
 
 -- Indexes for performance
 CREATE INDEX idx_programs_church_id ON programs(church_id);
 CREATE INDEX idx_attendees_program_id ON attendees(program_id);
 CREATE INDEX idx_attendees_program_time ON attendees(program_id, scan_time DESC);
 CREATE INDEX idx_attendees_program_winner_gifted ON attendees(program_id, is_winner, is_gifted);
+CREATE INDEX idx_attendees_proxy_host ON attendees(program_id, proxy_host_fingerprint);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_attendees_scan_id_unique ON attendees(scan_id) WHERE scan_id IS NOT NULL;
 CREATE INDEX idx_scans_program_id ON scans(program_id);
 CREATE INDEX idx_scans_device ON scans(device_fingerprint);
+CREATE INDEX idx_scans_proxy_host ON scans(program_id, proxy_host_fingerprint);
+CREATE INDEX IF NOT EXISTS idx_scans_program_device_time ON scans(program_id, device_fingerprint, scan_time DESC);
 CREATE INDEX idx_programs_date ON programs(church_id, date);
 CREATE INDEX idx_scans_time ON scans(program_id, scan_time);
 CREATE INDEX IF NOT EXISTS idx_event_sponsors_program_id ON event_sponsors(program_id);

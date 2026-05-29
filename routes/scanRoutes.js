@@ -16,6 +16,9 @@ router.post('/program/:programId', scanWriteLimiter, scanController.scanQR);
 // Submit form data only (public)
 router.post('/program/:programId/form', scanWriteLimiter, scanController.submitFormData);
 
+// Submit proxy attendee check-in (public)
+router.post('/program/:programId/proxy', scanWriteLimiter, scanController.submitProxyAttendee);
+
 // Update scan data (public)
 router.put('/program/:programId/update-scan', scanWriteLimiter, scanController.updateScanData);
 

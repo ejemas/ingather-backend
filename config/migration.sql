@@ -119,3 +119,34 @@ CREATE INDEX IF NOT EXISTS idx_sponsor_click_events_sponsor_time ON sponsor_clic
 -- Migration: Scan session tokens for public scan follow-up mutations
 ALTER TABLE scans ADD COLUMN IF NOT EXISTS scan_token_hash VARCHAR(128);
 ALTER TABLE scans ADD COLUMN IF NOT EXISTS scan_token_expires_at TIMESTAMP;
+
+-- Migration: Proxy check-in / scan for others
+ALTER TABLE programs ADD COLUMN IF NOT EXISTS proxy_checkin_enabled BOOLEAN DEFAULT FALSE;
+ALTER TABLE scans ADD COLUMN IF NOT EXISTS proxy_host_fingerprint VARCHAR(500);
+ALTER TABLE attendees ADD COLUMN IF NOT EXISTS proxy_host_fingerprint VARCHAR(500);
+CREATE INDEX IF NOT EXISTS idx_attendees_proxy_host ON attendees(program_id, proxy_host_fingerprint);
+CREATE INDEX IF NOT EXISTS idx_scans_proxy_host ON scans(program_id, proxy_host_fingerprint);
+
+-- Migration: Device fingerprint control for collect-data programs
+ALTER TABLE programs ADD COLUMN IF NOT EXISTS strict_device_fingerprinting BOOLEAN DEFAULT TRUE;
+ALTER TABLE programs ALTER COLUMN strict_device_fingerprinting SET DEFAULT TRUE;
+UPDATE programs SET strict_device_fingerprinting = TRUE WHERE strict_device_fingerprinting IS NULL;
+ALTER TABLE programs ALTER COLUMN strict_device_fingerprinting SET NOT NULL;
+
+ALTER TABLE attendees ADD COLUMN IF NOT EXISTS scan_id INTEGER;
+ALTER TABLE scans DROP CONSTRAINT IF EXISTS scans_program_id_device_fingerprint_key;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'attendees_scan_id_fkey'
+  ) THEN
+    ALTER TABLE attendees
+      ADD CONSTRAINT attendees_scan_id_fkey
+      FOREIGN KEY (scan_id) REFERENCES scans(id) ON DELETE SET NULL;
+  END IF;
+END;
+$$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_attendees_scan_id_unique ON attendees(scan_id) WHERE scan_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_scans_program_device_time ON scans(program_id, device_fingerprint, scan_time DESC);

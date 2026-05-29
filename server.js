@@ -144,6 +144,17 @@ pool.query(`
   .then(() => console.log('Migration check: security columns ready'))
   .catch(err => console.error('Migration warning (security columns):', err.message));
 
+// Auto-migrate: add proxy check-in columns
+pool.query(`
+  ALTER TABLE programs ADD COLUMN IF NOT EXISTS proxy_checkin_enabled BOOLEAN DEFAULT FALSE;
+  ALTER TABLE scans ADD COLUMN IF NOT EXISTS proxy_host_fingerprint VARCHAR(500);
+  ALTER TABLE attendees ADD COLUMN IF NOT EXISTS proxy_host_fingerprint VARCHAR(500);
+  CREATE INDEX IF NOT EXISTS idx_attendees_proxy_host ON attendees(program_id, proxy_host_fingerprint);
+  CREATE INDEX IF NOT EXISTS idx_scans_proxy_host ON scans(program_id, proxy_host_fingerprint);
+`)
+  .then(() => console.log('Migration check: proxy check-in columns ready'))
+  .catch(err => console.error('Migration warning (proxy check-in):', err.message));
+
 // Auto-migrate: add optional program flyer metadata columns if they don't exist
 pool.query(`
   ALTER TABLE programs ADD COLUMN IF NOT EXISTS flyer_type VARCHAR(30) DEFAULT 'standard';

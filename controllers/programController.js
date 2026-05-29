@@ -1,5 +1,6 @@
 const pool = require('../config/database');
 const QRCode = require('qrcode');
+const crypto = require('crypto');
 const { uploadEventFlyer, deleteEventFlyer } = require('../utils/supabaseStorage');
 
 const normalizeFlyerType = (flyerType) => (
@@ -128,6 +129,53 @@ const mapChurch = (church) => ({
   createdAt: church.created_at
 });
 
+const getDateOnly = (value) => {
+  if (!value) return '';
+  if (typeof value === 'string') return value.slice(0, 10);
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  return String(value).slice(0, 10);
+};
+
+const getTodayDateOnly = () => new Date().toISOString().split('T')[0];
+
+const getProgramStatus = (program, today = getTodayDateOnly()) => {
+  if (!program.is_active) return 'completed';
+  return getDateOnly(program.date) > today ? 'upcoming' : 'active';
+};
+
+const buildProgramListQueryParts = (churchId, startDate, endDate, today = getTodayDateOnly()) => {
+  const params = [churchId];
+  let datePredicate = '';
+  let paramIndex = 2;
+
+  if (startDate && endDate) {
+    datePredicate = `p.date >= $${paramIndex}::date AND p.date <= $${paramIndex + 1}::date`;
+    params.push(startDate, endDate);
+    paramIndex += 2;
+  } else if (startDate) {
+    datePredicate = `p.date >= $${paramIndex}::date`;
+    params.push(startDate);
+    paramIndex += 1;
+  } else if (endDate) {
+    datePredicate = `p.date <= $${paramIndex}::date`;
+    params.push(endDate);
+    paramIndex += 1;
+  }
+
+  if (!datePredicate) {
+    return {
+      whereClause: 'p.church_id = $1',
+      params
+    };
+  }
+
+  params.push(today);
+  return {
+    whereClause: `p.church_id = $1 AND (${datePredicate} OR (p.is_active = true AND p.date > $${paramIndex}::date))`,
+    params
+  };
+};
+
 const mapProgramDetail = (program, counts = {}) => ({
   id: program.id,
   title: program.title,
@@ -147,11 +195,14 @@ const mapProgramDetail = (program, counts = {}) => ({
   flyerUrl: program.flyer_url,
   sponsorDisplayMode: program.sponsor_display_mode || 'carousel',
   sponsorExpectedAttendees: program.sponsor_expected_attendees,
+  proxyCheckinEnabled: program.proxy_checkin_enabled || false,
+  strictDeviceFingerprinting: program.strict_device_fingerprinting !== false,
   qrCodeUrl: program.qr_code_url,
   isActive: program.is_active,
   totalScans: program.total_scans,
   attendeesCount: counts.attendeesCount || 0,
-  firstTimersCount: counts.firstTimersCount || 0
+  firstTimersCount: counts.firstTimersCount || 0,
+  sharedDeviceCheckins: counts.sharedDeviceCheckins || 0
 });
 
 const mapAttendee = (attendee) => ({
@@ -166,6 +217,8 @@ const mapAttendee = (attendee) => ({
   sex: attendee.sex,
   isWinner: attendee.is_winner,
   isGifted: attendee.is_gifted || false,
+  proxyHostFingerprint: attendee.proxy_host_fingerprint || null,
+  scanId: attendee.scan_id || null,
   scanTime: attendee.scan_time
 });
 
@@ -224,18 +277,9 @@ const buildDashboardStatsPayload = async (churchId, startDate, endDate) => {
     paramIndex += 1;
   }
 
-  const today = new Date().toISOString().split('T')[0];
+  const today = getTodayDateOnly();
   const upcomingParams = [churchId, today];
-  let upcomingDateFilter = '';
-  let upcomingParamIndex = 3;
-
-  if (startDate && endDate) {
-    upcomingDateFilter = ` AND p.date >= $${upcomingParamIndex}::date AND p.date <= $${upcomingParamIndex + 1}::date`;
-    upcomingParams.push(startDate, endDate);
-  } else if (endDate) {
-    upcomingDateFilter = ` AND p.date <= $${upcomingParamIndex}::date`;
-    upcomingParams.push(endDate);
-  }
+  const programListQuery = buildProgramListQueryParts(churchId, startDate, endDate, today);
 
   const [
     summaryResult,
@@ -254,7 +298,7 @@ const buildDashboardStatsPayload = async (churchId, startDate, endDate) => {
     pool.query(
       `SELECT COUNT(*) as upcoming_count
        FROM programs p
-       WHERE p.church_id = $1 AND p.date > $2 AND p.is_active = true${upcomingDateFilter}`,
+       WHERE p.church_id = $1 AND p.date > $2::date AND p.is_active = true`,
       upcomingParams
     ),
     pool.query(
@@ -291,9 +335,9 @@ const buildDashboardStatsPayload = async (churchId, startDate, endDate) => {
     ),
     pool.query(
       `SELECT * FROM programs p
-       WHERE p.church_id = $1${dateFilter}
+       WHERE ${programListQuery.whereClause}
        ORDER BY p.date DESC, p.start_time DESC`,
-      params
+      programListQuery.params
     )
   ]);
 
@@ -332,6 +376,7 @@ const buildDashboardStatsPayload = async (churchId, startDate, endDate) => {
       trackingMode: program.tracking_mode,
       totalScans: program.total_scans,
       isActive: program.is_active,
+      status: getProgramStatus(program, today),
       giftingEnabled: program.gifting_enabled,
       flyerType: program.flyer_type || 'standard',
       personalizedFlyerConfig: program.personalized_flyer_config,
@@ -340,6 +385,8 @@ const buildDashboardStatsPayload = async (churchId, startDate, endDate) => {
       flyerUrl: program.flyer_url,
       sponsorDisplayMode: program.sponsor_display_mode || 'carousel',
       sponsorExpectedAttendees: program.sponsor_expected_attendees,
+      proxyCheckinEnabled: program.proxy_checkin_enabled || false,
+      strictDeviceFingerprinting: program.strict_device_fingerprinting !== false,
       createdAt: program.created_at
     }))
   };
@@ -409,6 +456,25 @@ const buildCountOnlyStatsPayload = async (programId) => {
   };
 };
 
+const getSharedDeviceCheckins = async (db, programId) => {
+  const result = await db.query(
+    `SELECT COALESCE(SUM(device_count - 1), 0) AS shared_device_checkins
+     FROM (
+       SELECT device_fingerprint, COUNT(*) AS device_count
+       FROM attendees
+       WHERE program_id = $1
+         AND proxy_host_fingerprint IS NULL
+         AND device_fingerprint NOT LIKE 'manual-%'
+         AND device_fingerprint NOT LIKE 'proxy-%'
+       GROUP BY device_fingerprint
+       HAVING COUNT(*) > 1
+     ) duplicate_devices`,
+    [programId]
+  );
+
+  return parseInt(result.rows[0].shared_device_checkins, 10) || 0;
+};
+
 // Create Program
 exports.createProgram = async (req, res) => {
   try {
@@ -428,6 +494,8 @@ exports.createProgram = async (req, res) => {
       personalizedLogo,
       sponsorDisplayMode: requestedSponsorDisplayMode,
       sponsorExpectedAttendees,
+      proxyCheckinEnabled,
+      strictDeviceFingerprinting,
       sponsors: requestedSponsors
     } = req.body;
 
@@ -440,6 +508,8 @@ exports.createProgram = async (req, res) => {
       : null;
     const resolvedDataFields = { ...(dataFields || {}) };
     const resolvedTrackingMode = flyerType === 'personalized' ? 'collect-data' : trackingMode;
+    const normalizedProxyCheckinEnabled = resolvedTrackingMode === 'collect-data' && proxyCheckinEnabled === true;
+    const normalizedStrictDeviceFingerprinting = resolvedTrackingMode !== 'collect-data' || strictDeviceFingerprinting !== false;
     const resolvedPersonalizedConfig = normalizePersonalizedFlyerConfig(personalizedFlyerConfig);
     let uploadedFlyer = null;
     let uploadedPersonalizedBackground = null;
@@ -513,9 +583,9 @@ exports.createProgram = async (req, res) => {
       transactionStarted = true;
 
       result = await client.query(
-        `INSERT INTO programs 
-         (church_id, title, date, start_time, end_time, tracking_mode, data_fields, gifting_enabled, total_winners, flyer_type, flyer_url, flyer_storage_path, flyer_original_name, personalized_flyer_config, personalized_background_url, personalized_background_storage_path, personalized_background_original_name, personalized_logo_url, personalized_logo_storage_path, personalized_logo_original_name, sponsor_display_mode, sponsor_expected_attendees) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22) 
+        `INSERT INTO programs
+         (church_id, title, date, start_time, end_time, tracking_mode, data_fields, gifting_enabled, total_winners, flyer_type, flyer_url, flyer_storage_path, flyer_original_name, personalized_flyer_config, personalized_background_url, personalized_background_storage_path, personalized_background_original_name, personalized_logo_url, personalized_logo_storage_path, personalized_logo_original_name, sponsor_display_mode, sponsor_expected_attendees, proxy_checkin_enabled, strict_device_fingerprinting)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
          RETURNING *`,
         [
           churchId,
@@ -539,7 +609,9 @@ exports.createProgram = async (req, res) => {
           uploadedPersonalizedLogo?.flyerStoragePath || null,
           personalizedLogo?.originalName || null,
           sponsorDisplayMode,
-          normalizedSponsorExpectedAttendees
+          normalizedSponsorExpectedAttendees,
+          normalizedProxyCheckinEnabled,
+          normalizedStrictDeviceFingerprinting
         ]
       );
 
@@ -631,11 +703,13 @@ exports.createProgram = async (req, res) => {
         flyerType: program.flyer_type,
         personalizedFlyerConfig: program.personalized_flyer_config,
         personalizedBackgroundUrl: program.personalized_background_url,
-        personalizedLogoUrl: program.personalized_logo_url,
-        flyerUrl: program.flyer_url,
-        sponsorDisplayMode: program.sponsor_display_mode,
-        sponsorExpectedAttendees: program.sponsor_expected_attendees,
-        sponsors: uploadedSponsors.map((sponsor, index) => ({
+      personalizedLogoUrl: program.personalized_logo_url,
+      flyerUrl: program.flyer_url,
+      sponsorDisplayMode: program.sponsor_display_mode,
+      sponsorExpectedAttendees: program.sponsor_expected_attendees,
+      proxyCheckinEnabled: program.proxy_checkin_enabled || false,
+      strictDeviceFingerprinting: program.strict_device_fingerprinting !== false,
+      sponsors: uploadedSponsors.map((sponsor, index) => ({
           id: index,
           sponsorName: sponsor.sponsorName,
           flyerUrl: sponsor.flyerUrl,
@@ -689,8 +763,11 @@ exports.getPrograms = async (req, res) => {
       flyerUrl: program.flyer_url,
       sponsorDisplayMode: program.sponsor_display_mode || 'carousel',
       sponsorExpectedAttendees: program.sponsor_expected_attendees,
+      proxyCheckinEnabled: program.proxy_checkin_enabled || false,
+      strictDeviceFingerprinting: program.strict_device_fingerprinting !== false,
       qrCodeUrl: program.qr_code_url,
       isActive: program.is_active,
+      status: getProgramStatus(program),
       totalScans: program.total_scans,
       createdAt: program.created_at
     }));
@@ -760,6 +837,8 @@ exports.getProgramById = async (req, res) => {
       [id]
     );
 
+    const sharedDeviceCheckins = await getSharedDeviceCheckins(pool, id);
+
     res.json({
       id: program.id,
       title: program.title,
@@ -779,11 +858,14 @@ exports.getProgramById = async (req, res) => {
       flyerUrl: program.flyer_url,
       sponsorDisplayMode: program.sponsor_display_mode || 'carousel',
       sponsorExpectedAttendees: program.sponsor_expected_attendees,
+      proxyCheckinEnabled: program.proxy_checkin_enabled || false,
+      strictDeviceFingerprinting: program.strict_device_fingerprinting !== false,
       qrCodeUrl: program.qr_code_url,
       isActive: program.is_active,
       totalScans: program.total_scans,
       attendeesCount: parseInt(attendeesResult.rows[0].count),
-      firstTimersCount: parseInt(firstTimersResult.rows[0].count)
+      firstTimersCount: parseInt(firstTimersResult.rows[0].count),
+      sharedDeviceCheckins
     });
   } catch (error) {
     console.error('Get program error:', error);
@@ -824,7 +906,8 @@ exports.getProgramDetailBootstrap = async (req, res) => {
       attendeesResult,
       attendanceData,
       countOnlyStats,
-      countOnlyScansResult
+      countOnlyScansResult,
+      sharedDeviceCheckins
     ] = await Promise.all([
       pool.query('SELECT COUNT(*) FROM attendees WHERE program_id = $1', [id]),
       pool.query('SELECT COUNT(*) FROM attendees WHERE program_id = $1 AND first_timer = true', [id]),
@@ -840,7 +923,8 @@ exports.getProgramDetailBootstrap = async (req, res) => {
              ORDER BY scan_time DESC`,
             [id]
           )
-        : Promise.resolve({ rows: [] })
+        : Promise.resolve({ rows: [] }),
+      getSharedDeviceCheckins(pool, id)
     ]);
 
     return res.json({
@@ -849,7 +933,8 @@ exports.getProgramDetailBootstrap = async (req, res) => {
       program: mapProgramDetail(program, {
         attendeesCount: parseInt(attendeesCountResult.rows[0].count, 10),
         firstTimersCount: parseInt(firstTimersResult.rows[0].count, 10),
-        winnersGifted: parseInt(winnersGiftedResult.rows[0].count, 10)
+        winnersGifted: parseInt(winnersGiftedResult.rows[0].count, 10),
+        sharedDeviceCheckins
       }),
       attendees: attendeesResult.rows.map(mapAttendee),
       attendanceData,
@@ -859,6 +944,40 @@ exports.getProgramDetailBootstrap = async (req, res) => {
   } catch (error) {
     console.error('Get program detail bootstrap error:', error);
     return res.status(500).json({ error: 'Server error fetching program detail bootstrap' });
+  }
+};
+
+exports.updateStrictDeviceFingerprinting = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const churchId = req.churchId;
+    const { strictDeviceFingerprinting } = req.body;
+
+    if (typeof strictDeviceFingerprinting !== 'boolean') {
+      return res.status(400).json({ error: 'Strict device fingerprinting value is required' });
+    }
+
+    const result = await pool.query(
+      `UPDATE programs
+       SET strict_device_fingerprinting = $1
+       WHERE id = $2 AND church_id = $3 AND tracking_mode = 'collect-data'
+       RETURNING id, strict_device_fingerprinting`,
+      [strictDeviceFingerprinting, id, churchId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Collect-data program not found' });
+    }
+
+    return res.json({
+      success: true,
+      strictDeviceFingerprinting: result.rows[0].strict_device_fingerprinting !== false
+    });
+  } catch (error) {
+    console.error('Update strict device fingerprinting error:', error);
+    return res.status(500).json({
+      error: error.message || 'Server error updating device fingerprinting setting'
+    });
   }
 };
 
@@ -905,25 +1024,165 @@ exports.getAttendees = async (req, res) => {
       [id]
     );
 
-    const attendees = result.rows.map(attendee => ({
-      id: attendee.id,
-      fullName: attendee.full_name,
-      phoneNumber: attendee.phone_number,
-      address: attendee.address,
-      firstTimer: attendee.first_timer,
-      department: attendee.department,
-      fellowship: attendee.fellowship,
-      age: attendee.age,
-      sex: attendee.sex,
-      isWinner: attendee.is_winner,
-      isGifted: attendee.is_gifted || false,
-      scanTime: attendee.scan_time
-    }));
+    const attendees = result.rows.map(mapAttendee);
 
     res.json({ attendees });
   } catch (error) {
     console.error('Get attendees error:', error);
     res.status(500).json({ error: 'Server error fetching attendees' });
+  }
+};
+
+exports.addManualAttendee = async (req, res) => {
+  const client = await pool.connect();
+  let transactionStarted = false;
+
+  try {
+    const { id } = req.params;
+    const churchId = req.churchId;
+    const formData = req.body.formData || {};
+
+    await client.query('BEGIN');
+    transactionStarted = true;
+
+    const programResult = await client.query(
+      'SELECT * FROM programs WHERE id = $1 AND church_id = $2',
+      [id, churchId]
+    );
+
+    if (programResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Program not found' });
+    }
+
+    const program = programResult.rows[0];
+    const dataFields = program.data_fields || {};
+
+    if (!program.is_active) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'This program is no longer active' });
+    }
+
+    if (program.tracking_mode !== 'collect-data') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Manual attendee entry is only available for collect-data programs' });
+    }
+
+    const cleanText = (value) => (typeof value === 'string' ? value.trim() : '');
+    const errors = {};
+
+    if (dataFields.fullName && !cleanText(formData.fullName)) errors.fullName = 'Full name is required';
+    if (dataFields.phoneNumber && !cleanText(formData.phoneNumber)) errors.phoneNumber = 'Phone number is required';
+    if (dataFields.address && !cleanText(formData.address)) errors.address = 'Address is required';
+    if (dataFields.department && !cleanText(formData.department)) errors.department = 'Department is required';
+    if (dataFields.sex && !cleanText(formData.sex)) errors.sex = 'Please select gender';
+
+    const age = formData.age === '' || formData.age === null || formData.age === undefined
+      ? null
+      : Number(formData.age);
+
+    if (dataFields.age && age !== null && (!Number.isInteger(age) || age < 0 || age > 130)) {
+      errors.age = 'Age must be a valid number';
+    }
+
+    if (Object.keys(errors).length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Please complete the required attendee fields', errors });
+    }
+
+    let isWinner = false;
+
+    if (program.gifting_enabled && program.winners_selected < program.total_winners) {
+      isWinner = Math.random() > 0.5;
+
+      if (isWinner) {
+        await client.query(
+          'UPDATE programs SET winners_selected = winners_selected + 1 WHERE id = $1',
+          [id]
+        );
+      }
+    }
+
+    const deviceFingerprint = `manual-${id}-${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
+    const firstTimer = Boolean(formData.firstTimer);
+    const sex = cleanText(formData.sex) || null;
+
+    const scanResult = await client.query(
+      `INSERT INTO scans
+       (program_id, device_fingerprint, gender, first_timer)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id`,
+      [id, deviceFingerprint, sex ? sex.toLowerCase() : null, firstTimer]
+    );
+
+    const updatedProgram = await client.query(
+      'UPDATE programs SET total_scans = total_scans + 1 WHERE id = $1 RETURNING total_scans',
+      [id]
+    );
+
+    const attendeeResult = await client.query(
+      `INSERT INTO attendees
+       (program_id, full_name, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       RETURNING *`,
+      [
+        id,
+        cleanText(formData.fullName) || null,
+        cleanText(formData.phoneNumber) || null,
+        cleanText(formData.address) || null,
+        firstTimer,
+        cleanText(formData.department) || null,
+        cleanText(formData.fellowship) || null,
+        age,
+        sex,
+        isWinner,
+        deviceFingerprint,
+        scanResult.rows[0].id
+      ]
+    );
+
+    const attendeeStats = await client.query(
+      `SELECT
+        COUNT(*) as total,
+        COUNT(CASE WHEN sex = 'Male' THEN 1 END) as male_count,
+        COUNT(CASE WHEN sex = 'Female' THEN 1 END) as female_count,
+        COUNT(CASE WHEN first_timer = true THEN 1 END) as first_timer_count
+       FROM attendees WHERE program_id = $1`,
+      [id]
+    );
+
+    await client.query('COMMIT');
+    transactionStarted = false;
+
+    const totalScans = parseInt(updatedProgram.rows[0].total_scans, 10);
+    const attendee = mapAttendee(attendeeResult.rows[0]);
+    const stats = {
+      attendeeMaleCount: parseInt(attendeeStats.rows[0].male_count, 10),
+      attendeeFemaleCount: parseInt(attendeeStats.rows[0].female_count, 10),
+      attendeeFirstTimerCount: parseInt(attendeeStats.rows[0].first_timer_count, 10),
+      attendeeTotal: parseInt(attendeeStats.rows[0].total, 10)
+    };
+
+    const io = req.app.get('io');
+    io?.emit(`program-${id}-update`, {
+      totalScans,
+      ...stats,
+      timestamp: new Date()
+    });
+
+    return res.status(201).json({
+      success: true,
+      attendee,
+      totalScans,
+      isWinner,
+      ...stats
+    });
+  } catch (error) {
+    if (transactionStarted) await client.query('ROLLBACK');
+    console.error('Manual attendee entry error:', error);
+    return res.status(500).json({ error: 'Server error adding manual attendee' });
+  } finally {
+    client.release();
   }
 };
 
@@ -1192,24 +1451,15 @@ exports.getDashboardStats = async (req, res) => {
 
     console.log(`📊 Found ${totalPrograms} programs, ${totalAttendance} total attendance in range`);
 
-    // 2. Upcoming Programs (date > today AND within range)
-    const today = new Date().toISOString().split('T')[0];
+    // 2. Upcoming Programs (active programs dated after today)
+    const today = getTodayDateOnly();
     const upcomingParams = [churchId, today];
-    let upcomingDateFilter = '';
-    let upcomingParamIndex = 3;
-
-    if (startDate && endDate) {
-      upcomingDateFilter = ` AND p.date >= $${upcomingParamIndex}::date AND p.date <= $${upcomingParamIndex + 1}::date`;
-      upcomingParams.push(startDate, endDate);
-    } else if (endDate) {
-      upcomingDateFilter = ` AND p.date <= $${upcomingParamIndex}::date`;
-      upcomingParams.push(endDate);
-    }
+    const programListQuery = buildProgramListQueryParts(churchId, startDate, endDate, today);
 
     const upcomingResult = await pool.query(
       `SELECT COUNT(*) as upcoming_count
        FROM programs p
-       WHERE p.church_id = $1 AND p.date > $2 AND p.is_active = true${upcomingDateFilter}`,
+       WHERE p.church_id = $1 AND p.date > $2::date AND p.is_active = true`,
       upcomingParams
     );
 
@@ -1283,9 +1533,9 @@ exports.getDashboardStats = async (req, res) => {
     // 6. Recent Programs in range
     const programsResult = await pool.query(
       `SELECT * FROM programs p
-       WHERE p.church_id = $1${dateFilter}
+       WHERE ${programListQuery.whereClause}
        ORDER BY p.date DESC, p.start_time DESC`,
-      params
+      programListQuery.params
     );
 
     const recentPrograms = programsResult.rows.map(program => ({
@@ -1297,6 +1547,7 @@ exports.getDashboardStats = async (req, res) => {
       trackingMode: program.tracking_mode,
       totalScans: program.total_scans,
       isActive: program.is_active,
+      status: getProgramStatus(program, today),
       giftingEnabled: program.gifting_enabled,
       flyerType: program.flyer_type || 'standard',
       personalizedFlyerConfig: program.personalized_flyer_config,
@@ -1305,6 +1556,8 @@ exports.getDashboardStats = async (req, res) => {
       flyerUrl: program.flyer_url,
       sponsorDisplayMode: program.sponsor_display_mode || 'carousel',
       sponsorExpectedAttendees: program.sponsor_expected_attendees,
+      proxyCheckinEnabled: program.proxy_checkin_enabled || false,
+      strictDeviceFingerprinting: program.strict_device_fingerprinting !== false,
       createdAt: program.created_at
     }));
 

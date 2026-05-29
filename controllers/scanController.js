@@ -36,16 +36,32 @@ const getScanSessionToken = (req) => {
   return req.body?.scanSessionToken || req.get('x-scan-session-token');
 };
 
-const verifyScanSession = async (client, programId, deviceFingerprint, token) => {
-  const normalizedFingerprint = normalizeDeviceFingerprint(deviceFingerprint);
+const getScanSessionId = (req) => {
+  return req.body?.scanSessionId || req.get('x-scan-session-id');
+};
 
-  if (!normalizedFingerprint || !token) {
+const normalizeScanSessionId = (scanSessionId) => {
+  const parsed = Number(scanSessionId);
+  if (!Number.isInteger(parsed) || parsed <= 0) return null;
+  return parsed;
+};
+
+const verifyScanSession = async (client, programId, scanSessionId, deviceFingerprint, token) => {
+  const normalizedFingerprint = normalizeDeviceFingerprint(deviceFingerprint);
+  const normalizedScanSessionId = normalizeScanSessionId(scanSessionId);
+
+  if (!normalizedFingerprint || !normalizedScanSessionId || !token) {
     return { status: 401, error: 'Valid scan session is required.' };
   }
 
   const scanResult = await client.query(
-    'SELECT * FROM scans WHERE program_id = $1 AND device_fingerprint = $2',
-    [programId, normalizedFingerprint]
+    `SELECT *
+     FROM scans
+     WHERE id = $1
+       AND program_id = $2
+       AND device_fingerprint = $3
+       AND proxy_host_fingerprint IS NULL`,
+    [normalizedScanSessionId, programId, normalizedFingerprint]
   );
 
   if (scanResult.rows.length === 0) {
@@ -67,6 +83,25 @@ const verifyScanSession = async (client, programId, deviceFingerprint, token) =>
   }
 
   return { scan, deviceFingerprint: normalizedFingerprint };
+};
+
+const getSharedDeviceCheckins = async (db, programId) => {
+  const result = await db.query(
+    `SELECT COALESCE(SUM(device_count - 1), 0) AS shared_device_checkins
+     FROM (
+       SELECT device_fingerprint, COUNT(*) AS device_count
+       FROM attendees
+       WHERE program_id = $1
+         AND proxy_host_fingerprint IS NULL
+         AND device_fingerprint NOT LIKE 'manual-%'
+         AND device_fingerprint NOT LIKE 'proxy-%'
+       GROUP BY device_fingerprint
+       HAVING COUNT(*) > 1
+     ) duplicate_devices`,
+    [programId]
+  );
+
+  return parseInt(result.rows[0].shared_device_checkins, 10) || 0;
 };
 
 const getCountStats = async (programId) => {
@@ -181,7 +216,7 @@ exports.scanQR = async (req, res) => {
     transactionStarted = true;
 
     const programResult = await client.query(
-      'SELECT id, tracking_mode, is_active, sponsor_display_mode FROM programs WHERE id = $1',
+      'SELECT id, tracking_mode, is_active, sponsor_display_mode, strict_device_fingerprinting FROM programs WHERE id = $1',
       [programId]
     );
 
@@ -199,12 +234,38 @@ exports.scanQR = async (req, res) => {
 
     const scanSessionToken = createScanSessionToken();
     const tokenExpiresAt = new Date(Date.now() + SCAN_TOKEN_TTL_MS);
+    const useStrictDeviceFingerprinting = program.tracking_mode !== 'collect-data' || program.strict_device_fingerprinting !== false;
+
+    if (useStrictDeviceFingerprinting) {
+      await client.query(
+        'SELECT pg_advisory_xact_lock(hashtext($1))',
+        [`scan:${programId}:${deviceFingerprint}`]
+      );
+
+      const existingScan = await client.query(
+        `SELECT id
+         FROM scans
+         WHERE program_id = $1
+           AND device_fingerprint = $2
+           AND proxy_host_fingerprint IS NULL
+         LIMIT 1`,
+        [programId, deviceFingerprint]
+      );
+
+      if (existingScan.rows.length > 0) {
+        await client.query('ROLLBACK');
+        transactionStarted = false;
+        return res.status(400).json({
+          error: 'This device has already scanned this program',
+          alreadyScanned: true
+        });
+      }
+    }
 
     const scanInsert = await client.query(
       `INSERT INTO scans 
        (program_id, device_fingerprint, gender, first_timer, scan_token_hash, scan_token_expires_at) 
        VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (program_id, device_fingerprint) DO NOTHING
        RETURNING id`,
       [
         programId,
@@ -215,15 +276,6 @@ exports.scanQR = async (req, res) => {
         tokenExpiresAt
       ]
     );
-
-    if (scanInsert.rows.length === 0) {
-      await client.query('ROLLBACK');
-      transactionStarted = false;
-      return res.status(400).json({
-        error: 'This device has already scanned this program',
-        alreadyScanned: true
-      });
-    }
 
     const updatedProgram = await client.query(
       'UPDATE programs SET total_scans = total_scans + 1 WHERE id = $1 RETURNING total_scans',
@@ -241,6 +293,7 @@ exports.scanQR = async (req, res) => {
       totalScans,
       firstScan: true,
       isFirstTimer: req.body.firstTimer || false,
+      scanSessionId: scanInsert.rows[0].id,
       scanSessionToken,
       scanSessionExpiresAt: tokenExpiresAt,
       sponsorPlacement
@@ -316,6 +369,8 @@ exports.getProgramInfo = async (req, res) => {
       personalizedLogoUrl: program.personalized_logo_url,
       flyerUrl: program.flyer_url,
       sponsorDisplayMode: program.sponsor_display_mode || 'carousel',
+      proxyCheckinEnabled: program.proxy_checkin_enabled || false,
+      strictDeviceFingerprinting: program.strict_device_fingerprinting !== false,
       isActive: program.is_active
     });
   } catch (error) {
@@ -351,15 +406,15 @@ exports.submitFormData = async (req, res) => {
       return res.status(400).json({ error: 'This program is no longer active' });
     }
 
-    const session = await verifyScanSession(client, programId, deviceFingerprint, getScanSessionToken(req));
+    const session = await verifyScanSession(client, programId, getScanSessionId(req), deviceFingerprint, getScanSessionToken(req));
     if (session.error) {
       await client.query('ROLLBACK');
       return res.status(session.status).json({ error: session.error });
     }
 
     const attendeeCheck = await client.query(
-      'SELECT id FROM attendees WHERE program_id = $1 AND device_fingerprint = $2',
-      [programId, session.deviceFingerprint]
+      'SELECT id FROM attendees WHERE scan_id = $1',
+      [session.scan.id]
     );
 
     if (attendeeCheck.rows.length > 0) {
@@ -381,9 +436,9 @@ exports.submitFormData = async (req, res) => {
     }
 
     await client.query(
-      `INSERT INTO attendees 
-       (program_id, full_name, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+      `INSERT INTO attendees
+       (program_id, full_name, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
       [
         programId,
         formData.fullName || null,
@@ -395,21 +450,25 @@ exports.submitFormData = async (req, res) => {
         formData.age || null,
         formData.sex || null,
         isWinner,
-        session.deviceFingerprint
+        session.deviceFingerprint,
+        session.scan.id
       ]
     );
 
     await client.query('COMMIT');
 
-    const attendeeStats = await pool.query(
-      `SELECT 
-        COUNT(*) as total,
-        COUNT(CASE WHEN sex = 'Male' THEN 1 END) as male_count,
-        COUNT(CASE WHEN sex = 'Female' THEN 1 END) as female_count,
-        COUNT(CASE WHEN first_timer = true THEN 1 END) as first_timer_count
-       FROM attendees WHERE program_id = $1`,
-      [programId]
-    );
+    const [attendeeStats, sharedDeviceCheckins] = await Promise.all([
+      pool.query(
+        `SELECT
+          COUNT(*) as total,
+          COUNT(CASE WHEN sex = 'Male' THEN 1 END) as male_count,
+          COUNT(CASE WHEN sex = 'Female' THEN 1 END) as female_count,
+          COUNT(CASE WHEN first_timer = true THEN 1 END) as first_timer_count
+         FROM attendees WHERE program_id = $1`,
+        [programId]
+      ),
+      getSharedDeviceCheckins(pool, programId)
+    ]);
 
     const io = req.app.get('io');
     io.emit(`program-${programId}-update`, {
@@ -417,6 +476,7 @@ exports.submitFormData = async (req, res) => {
       attendeeFemaleCount: parseInt(attendeeStats.rows[0].female_count, 10),
       attendeeFirstTimerCount: parseInt(attendeeStats.rows[0].first_timer_count, 10),
       attendeeTotal: parseInt(attendeeStats.rows[0].total, 10),
+      sharedDeviceCheckins,
       timestamp: new Date()
     });
 
@@ -426,12 +486,195 @@ exports.submitFormData = async (req, res) => {
       success: true,
       isWinner,
       giftingEnabled: program.gifting_enabled,
+      sharedDeviceCheckins,
       sponsorPlacement
     });
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Submit form error:', error);
+    if (error.code === '23505') {
+      return res.status(400).json({ error: 'Form already submitted for this scan' });
+    }
     return res.status(500).json({ error: 'Server error submitting form' });
+  } finally {
+    client.release();
+  }
+};
+
+// Submit a proxy attendee from an already checked-in host device.
+exports.submitProxyAttendee = async (req, res) => {
+  const client = await pool.connect();
+  let transactionStarted = false;
+
+  try {
+    const { programId } = req.params;
+    const hostDeviceFingerprint = normalizeDeviceFingerprint(req.body.hostDeviceFingerprint);
+    const formData = req.body.formData || {};
+
+    if (!hostDeviceFingerprint) {
+      return res.status(400).json({ error: 'A valid host device fingerprint is required' });
+    }
+
+    await client.query('BEGIN');
+    transactionStarted = true;
+
+    const programResult = await client.query(
+      'SELECT * FROM programs WHERE id = $1',
+      [programId]
+    );
+
+    if (programResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(404).json({ error: 'Program not found' });
+    }
+
+    const program = programResult.rows[0];
+    const dataFields = program.data_fields || {};
+
+    if (!program.is_active) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(400).json({ error: 'This program is no longer active' });
+    }
+
+    if (program.tracking_mode !== 'collect-data' || !program.proxy_checkin_enabled) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(400).json({ error: 'Proxy check-in is not enabled for this program' });
+    }
+
+    const hostAttendeeResult = await client.query(
+      `SELECT id FROM attendees
+       WHERE program_id = $1 AND device_fingerprint = $2 AND proxy_host_fingerprint IS NULL
+       LIMIT 1`,
+      [programId, hostDeviceFingerprint]
+    );
+
+    if (hostAttendeeResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(403).json({ error: 'Host attendee must complete check-in before adding guests' });
+    }
+
+    const proxyCountResult = await client.query(
+      'SELECT COUNT(*) FROM attendees WHERE program_id = $1 AND proxy_host_fingerprint = $2',
+      [programId, hostDeviceFingerprint]
+    );
+    const proxyCount = parseInt(proxyCountResult.rows[0].count, 10);
+
+    if (proxyCount >= 3) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(400).json({ error: 'Proxy check-in limit reached', proxyCount, remaining: 0 });
+    }
+
+    const cleanText = (value) => (typeof value === 'string' ? value.trim() : '');
+    const errors = {};
+
+    if (dataFields.fullName && !cleanText(formData.fullName)) errors.fullName = 'Full name is required';
+    if (dataFields.phoneNumber && !cleanText(formData.phoneNumber)) errors.phoneNumber = 'Phone number is required';
+    if (dataFields.address && !cleanText(formData.address)) errors.address = 'Address is required';
+    if (dataFields.department && !cleanText(formData.department)) errors.department = 'Department is required';
+    if (dataFields.sex && !cleanText(formData.sex)) errors.sex = 'Please select gender';
+
+    const age = formData.age === '' || formData.age === null || formData.age === undefined
+      ? null
+      : Number(formData.age);
+
+    if (dataFields.age && age !== null && (!Number.isInteger(age) || age < 0 || age > 130)) {
+      errors.age = 'Age must be a valid number';
+    }
+
+    if (Object.keys(errors).length > 0) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(400).json({ error: 'Please complete the required attendee fields', errors });
+    }
+
+    const proxyDeviceFingerprint = `proxy-${programId}-${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
+    const firstTimer = Boolean(formData.firstTimer);
+    const sex = cleanText(formData.sex) || null;
+
+    const scanResult = await client.query(
+      `INSERT INTO scans
+       (program_id, device_fingerprint, gender, first_timer, proxy_host_fingerprint)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
+      [programId, proxyDeviceFingerprint, sex ? sex.toLowerCase() : null, firstTimer, hostDeviceFingerprint]
+    );
+
+    const updatedProgram = await client.query(
+      'UPDATE programs SET total_scans = total_scans + 1 WHERE id = $1 RETURNING total_scans',
+      [programId]
+    );
+
+    const attendeeResult = await client.query(
+      `INSERT INTO attendees
+       (program_id, full_name, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, proxy_host_fingerprint, scan_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, $10, $11, $12)
+       RETURNING *`,
+      [
+        programId,
+        cleanText(formData.fullName) || null,
+        cleanText(formData.phoneNumber) || null,
+        cleanText(formData.address) || null,
+        firstTimer,
+        cleanText(formData.department) || null,
+        cleanText(formData.fellowship) || null,
+        age,
+        sex,
+        proxyDeviceFingerprint,
+        hostDeviceFingerprint,
+        scanResult.rows[0].id
+      ]
+    );
+
+    const attendeeStats = await client.query(
+      `SELECT
+        COUNT(*) as total,
+        COUNT(CASE WHEN sex = 'Male' THEN 1 END) as male_count,
+        COUNT(CASE WHEN sex = 'Female' THEN 1 END) as female_count,
+        COUNT(CASE WHEN first_timer = true THEN 1 END) as first_timer_count
+       FROM attendees WHERE program_id = $1`,
+      [programId]
+    );
+
+    await client.query('COMMIT');
+    transactionStarted = false;
+
+    const totalScans = parseInt(updatedProgram.rows[0].total_scans, 10);
+    const savedProxyCount = proxyCount + 1;
+    const stats = {
+      attendeeMaleCount: parseInt(attendeeStats.rows[0].male_count, 10),
+      attendeeFemaleCount: parseInt(attendeeStats.rows[0].female_count, 10),
+      attendeeFirstTimerCount: parseInt(attendeeStats.rows[0].first_timer_count, 10),
+      attendeeTotal: parseInt(attendeeStats.rows[0].total, 10)
+    };
+
+    const io = req.app.get('io');
+    io?.emit(`program-${programId}-update`, {
+      totalScans,
+      ...stats,
+      timestamp: new Date()
+    });
+
+    return res.status(201).json({
+      success: true,
+      attendee: {
+        id: attendeeResult.rows[0].id,
+        fullName: attendeeResult.rows[0].full_name,
+        proxyHostFingerprint: attendeeResult.rows[0].proxy_host_fingerprint
+      },
+      proxyCount: savedProxyCount,
+      remaining: Math.max(0, 3 - savedProxyCount),
+      totalScans,
+      ...stats
+    });
+  } catch (error) {
+    if (transactionStarted) await client.query('ROLLBACK');
+    console.error('Proxy check-in error:', error);
+    return res.status(500).json({ error: 'Server error adding proxy attendee' });
   } finally {
     client.release();
   }
@@ -445,7 +688,7 @@ exports.updateScanData = async (req, res) => {
     const { programId } = req.params;
     const { deviceFingerprint, gender, firstTimer } = req.body;
 
-    const session = await verifyScanSession(client, programId, deviceFingerprint, getScanSessionToken(req));
+    const session = await verifyScanSession(client, programId, getScanSessionId(req), deviceFingerprint, getScanSessionToken(req));
     if (session.error) {
       return res.status(session.status).json({ error: session.error });
     }
@@ -453,9 +696,9 @@ exports.updateScanData = async (req, res) => {
     const result = await client.query(
       `UPDATE scans 
        SET gender = $1, first_timer = $2 
-       WHERE program_id = $3 AND device_fingerprint = $4
+       WHERE id = $3 AND program_id = $4
        RETURNING *`,
-      [gender, Boolean(firstTimer), programId, session.deviceFingerprint]
+      [gender, Boolean(firstTimer), session.scan.id, programId]
     );
 
     if (result.rows.length === 0) {
