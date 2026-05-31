@@ -3,6 +3,14 @@ const QRCode = require('qrcode');
 const crypto = require('crypto');
 const { uploadEventFlyer, deleteEventFlyer } = require('../utils/supabaseStorage');
 
+const CANONICAL_PUBLIC_FRONTEND_ORIGIN = 'https://ingather.app';
+
+const trimTrailingSlash = (value) => String(value || '').replace(/\/+$/, '');
+
+const getPublicScanUrl = (programId) => (
+  `${trimTrailingSlash(CANONICAL_PUBLIC_FRONTEND_ORIGIN)}/scan/${programId}`
+);
+
 const normalizeFlyerType = (flyerType) => (
   flyerType === 'personalized' ? 'personalized' : 'standard'
 );
@@ -223,7 +231,7 @@ const mapProgramDetail = (program, counts = {}) => ({
   sponsorExpectedAttendees: program.sponsor_expected_attendees,
   proxyCheckinEnabled: program.proxy_checkin_enabled || false,
   strictDeviceFingerprinting: program.strict_device_fingerprinting !== false,
-  qrCodeUrl: program.qr_code_url,
+  qrCodeUrl: getPublicScanUrl(program.id),
   isActive: program.is_active,
   totalScans: program.total_scans,
   attendeesCount: counts.attendeesCount || 0,
@@ -669,7 +677,7 @@ exports.createProgram = async (req, res) => {
       }
 
       // Generate QR Code URL
-      const qrCodeUrl = `${process.env.FRONTEND_URL}/scan/${program.id}`;
+      const qrCodeUrl = getPublicScanUrl(program.id);
 
       // Update program with QR code URL
       await client.query(
@@ -712,7 +720,7 @@ exports.createProgram = async (req, res) => {
 
     const program = result.rows[0];
 
-    const qrCodeUrl = `${process.env.FRONTEND_URL}/scan/${program.id}`;
+    const qrCodeUrl = getPublicScanUrl(program.id);
 
     // Generate QR code image as base64
     const qrCodeImage = await QRCode.toDataURL(qrCodeUrl);
@@ -794,7 +802,7 @@ exports.getPrograms = async (req, res) => {
       sponsorExpectedAttendees: program.sponsor_expected_attendees,
       proxyCheckinEnabled: program.proxy_checkin_enabled || false,
       strictDeviceFingerprinting: program.strict_device_fingerprinting !== false,
-      qrCodeUrl: program.qr_code_url,
+      qrCodeUrl: getPublicScanUrl(program.id),
       isActive: program.is_active,
       status: getProgramStatus(program),
       totalScans: program.total_scans,
@@ -889,7 +897,7 @@ exports.getProgramById = async (req, res) => {
       sponsorExpectedAttendees: program.sponsor_expected_attendees,
       proxyCheckinEnabled: program.proxy_checkin_enabled || false,
       strictDeviceFingerprinting: program.strict_device_fingerprinting !== false,
-      qrCodeUrl: program.qr_code_url,
+      qrCodeUrl: getPublicScanUrl(program.id),
       isActive: program.is_active,
       totalScans: program.total_scans,
       attendeesCount: parseInt(attendeesResult.rows[0].count),
