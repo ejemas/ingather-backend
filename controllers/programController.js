@@ -7,11 +7,37 @@ const normalizeFlyerType = (flyerType) => (
   flyerType === 'personalized' ? 'personalized' : 'standard'
 );
 
+const parsePersonalizedTemplates = (value) => (
+  String(value || '')
+    .split(/\r?\n/)
+    .map(message => message.trim())
+    .filter(Boolean)
+);
+
+const normalizeCollectedEmail = (value) => (
+  typeof value === 'string' ? value.trim().toLowerCase() : ''
+);
+
+const isValidCollectedEmail = (value) => {
+  const email = normalizeCollectedEmail(value);
+  return email.length > 0
+    && email.length <= 255
+    && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+    && email.indexOf('@') === email.lastIndexOf('@');
+};
+
 const normalizePersonalizedFlyerConfig = (config = {}) => {
-  const template = typeof config.template === 'string' ? config.template.trim() : '';
+  const templatesFromArray = Array.isArray(config.templates)
+    ? config.templates.map(message => String(message || '').trim()).filter(Boolean)
+    : [];
+  const templates = templatesFromArray.length > 0
+    ? templatesFromArray
+    : parsePersonalizedTemplates(config.template);
+  const template = templates[0] || '';
 
   return {
     template,
+    templates,
     brandColor: typeof config.brandColor === 'string' && /^#[0-9A-Fa-f]{6}$/.test(config.brandColor)
       ? config.brandColor
       : '#E8590C',
@@ -208,6 +234,8 @@ const mapProgramDetail = (program, counts = {}) => ({
 const mapAttendee = (attendee) => ({
   id: attendee.id,
   fullName: attendee.full_name,
+  emailAddress: attendee.email_address,
+  school: attendee.school,
   phoneNumber: attendee.phone_number,
   address: attendee.address,
   firstTimer: attendee.first_timer,
@@ -217,6 +245,7 @@ const mapAttendee = (attendee) => ({
   sex: attendee.sex,
   isWinner: attendee.is_winner,
   isGifted: attendee.is_gifted || false,
+  personalizedMessage: attendee.personalized_message || null,
   proxyHostFingerprint: attendee.proxy_host_fingerprint || null,
   scanId: attendee.scan_id || null,
   scanTime: attendee.scan_time
@@ -1072,6 +1101,11 @@ exports.addManualAttendee = async (req, res) => {
     const errors = {};
 
     if (dataFields.fullName && !cleanText(formData.fullName)) errors.fullName = 'Full name is required';
+    if (dataFields.emailAddress) {
+      if (!normalizeCollectedEmail(formData.emailAddress)) errors.emailAddress = 'Email address is required';
+      else if (!isValidCollectedEmail(formData.emailAddress)) errors.emailAddress = 'Enter a valid email address';
+    }
+    if (dataFields.school && !cleanText(formData.school)) errors.school = 'School is required';
     if (dataFields.phoneNumber && !cleanText(formData.phoneNumber)) errors.phoneNumber = 'Phone number is required';
     if (dataFields.address && !cleanText(formData.address)) errors.address = 'Address is required';
     if (dataFields.department && !cleanText(formData.department)) errors.department = 'Department is required';
@@ -1106,6 +1140,8 @@ exports.addManualAttendee = async (req, res) => {
     const deviceFingerprint = `manual-${id}-${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
     const firstTimer = Boolean(formData.firstTimer);
     const sex = cleanText(formData.sex) || null;
+    const emailAddress = dataFields.emailAddress ? normalizeCollectedEmail(formData.emailAddress) : null;
+    const school = dataFields.school ? cleanText(formData.school) : null;
 
     const scanResult = await client.query(
       `INSERT INTO scans
@@ -1122,12 +1158,14 @@ exports.addManualAttendee = async (req, res) => {
 
     const attendeeResult = await client.query(
       `INSERT INTO attendees
-       (program_id, full_name, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       (program_id, full_name, email_address, school, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
        RETURNING *`,
       [
         id,
         cleanText(formData.fullName) || null,
+        emailAddress,
+        school,
         cleanText(formData.phoneNumber) || null,
         cleanText(formData.address) || null,
         firstTimer,

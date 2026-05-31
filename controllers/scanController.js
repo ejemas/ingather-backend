@@ -32,6 +32,18 @@ const normalizeDeviceFingerprint = (deviceFingerprint) => {
   return trimmed;
 };
 
+const cleanText = (value) => (typeof value === 'string' ? value.trim() : '');
+
+const normalizeCollectedEmail = (value) => cleanText(value).toLowerCase();
+
+const isValidCollectedEmail = (value) => {
+  const email = normalizeCollectedEmail(value);
+  return email.length > 0
+    && email.length <= 255
+    && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+    && email.indexOf('@') === email.lastIndexOf('@');
+};
+
 const getScanSessionToken = (req) => {
   return req.body?.scanSessionToken || req.get('x-scan-session-token');
 };
@@ -102,6 +114,39 @@ const getSharedDeviceCheckins = async (db, programId) => {
   );
 
   return parseInt(result.rows[0].shared_device_checkins, 10) || 0;
+};
+
+const parsePersonalizedTemplates = (config = {}) => {
+  const fromArray = Array.isArray(config.templates)
+    ? config.templates.map(message => String(message || '').trim()).filter(Boolean)
+    : [];
+
+  if (fromArray.length > 0) return fromArray;
+
+  return String(config.template || '')
+    .split(/\r?\n/)
+    .map(message => message.trim())
+    .filter(Boolean);
+};
+
+const getFirstName = (fullName) => {
+  const firstName = String(fullName || '').trim().split(/\s+/)[0];
+  return firstName || 'Friend';
+};
+
+const personalizeTemplate = (template, firstName) => (
+  String(template || '[FirstName], you are welcome and deeply valued.')
+    .replace(/\[FirstName\]/gi, firstName)
+);
+
+const selectPersonalizedMessage = (program, formData) => {
+  if (program.flyer_type !== 'personalized') return null;
+
+  const templates = parsePersonalizedTemplates(program.personalized_flyer_config || {});
+  if (templates.length === 0) return null;
+
+  const selectedTemplate = templates[Math.floor(Math.random() * templates.length)];
+  return personalizeTemplate(selectedTemplate, getFirstName(formData.fullName));
 };
 
 const getCountStats = async (programId) => {
@@ -406,6 +451,8 @@ exports.submitFormData = async (req, res) => {
       return res.status(400).json({ error: 'This program is no longer active' });
     }
 
+    const dataFields = program.data_fields || {};
+
     const session = await verifyScanSession(client, programId, getScanSessionId(req), deviceFingerprint, getScanSessionToken(req));
     if (session.error) {
       await client.query('ROLLBACK');
@@ -422,7 +469,22 @@ exports.submitFormData = async (req, res) => {
       return res.status(400).json({ error: 'Form already submitted for this scan' });
     }
 
+    const errors = {};
+    if (dataFields.emailAddress) {
+      if (!normalizeCollectedEmail(formData.emailAddress)) errors.emailAddress = 'Email address is required';
+      else if (!isValidCollectedEmail(formData.emailAddress)) errors.emailAddress = 'Enter a valid email address';
+    }
+    if (dataFields.school && !cleanText(formData.school)) errors.school = 'School is required';
+
+    if (Object.keys(errors).length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Please complete the required attendee fields', errors });
+    }
+
     let isWinner = false;
+    const personalizedMessage = selectPersonalizedMessage(program, formData);
+    const emailAddress = dataFields.emailAddress ? normalizeCollectedEmail(formData.emailAddress) : null;
+    const school = dataFields.school ? cleanText(formData.school) : null;
 
     if (program.gifting_enabled && program.winners_selected < program.total_winners) {
       isWinner = Math.random() > 0.5;
@@ -437,11 +499,13 @@ exports.submitFormData = async (req, res) => {
 
     await client.query(
       `INSERT INTO attendees
-       (program_id, full_name, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+       (program_id, full_name, email_address, school, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id, personalized_message)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
       [
         programId,
         formData.fullName || null,
+        emailAddress,
+        school,
         formData.phoneNumber || null,
         formData.address || null,
         formData.firstTimer || false,
@@ -451,7 +515,8 @@ exports.submitFormData = async (req, res) => {
         formData.sex || null,
         isWinner,
         session.deviceFingerprint,
-        session.scan.id
+        session.scan.id,
+        personalizedMessage
       ]
     );
 
@@ -486,6 +551,7 @@ exports.submitFormData = async (req, res) => {
       success: true,
       isWinner,
       giftingEnabled: program.gifting_enabled,
+      personalizedMessage,
       sharedDeviceCheckins,
       sponsorPlacement
     });
@@ -573,6 +639,11 @@ exports.submitProxyAttendee = async (req, res) => {
     const errors = {};
 
     if (dataFields.fullName && !cleanText(formData.fullName)) errors.fullName = 'Full name is required';
+    if (dataFields.emailAddress) {
+      if (!normalizeCollectedEmail(formData.emailAddress)) errors.emailAddress = 'Email address is required';
+      else if (!isValidCollectedEmail(formData.emailAddress)) errors.emailAddress = 'Enter a valid email address';
+    }
+    if (dataFields.school && !cleanText(formData.school)) errors.school = 'School is required';
     if (dataFields.phoneNumber && !cleanText(formData.phoneNumber)) errors.phoneNumber = 'Phone number is required';
     if (dataFields.address && !cleanText(formData.address)) errors.address = 'Address is required';
     if (dataFields.department && !cleanText(formData.department)) errors.department = 'Department is required';
@@ -595,6 +666,8 @@ exports.submitProxyAttendee = async (req, res) => {
     const proxyDeviceFingerprint = `proxy-${programId}-${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
     const firstTimer = Boolean(formData.firstTimer);
     const sex = cleanText(formData.sex) || null;
+    const emailAddress = dataFields.emailAddress ? normalizeCollectedEmail(formData.emailAddress) : null;
+    const school = dataFields.school ? cleanText(formData.school) : null;
 
     const scanResult = await client.query(
       `INSERT INTO scans
@@ -611,12 +684,14 @@ exports.submitProxyAttendee = async (req, res) => {
 
     const attendeeResult = await client.query(
       `INSERT INTO attendees
-       (program_id, full_name, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, proxy_host_fingerprint, scan_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, $10, $11, $12)
+       (program_id, full_name, email_address, school, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, proxy_host_fingerprint, scan_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, false, $12, $13, $14)
        RETURNING *`,
       [
         programId,
         cleanText(formData.fullName) || null,
+        emailAddress,
+        school,
         cleanText(formData.phoneNumber) || null,
         cleanText(formData.address) || null,
         firstTimer,

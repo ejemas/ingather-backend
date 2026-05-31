@@ -120,13 +120,21 @@ pool.query(`
   .catch(err => console.error('Migration warning (organization type):', err.message));
 
 // Auto-migrate: add is_gifted column if it doesn't exist
-pool.query(`ALTER TABLE attendees ADD COLUMN IF NOT EXISTS is_gifted BOOLEAN DEFAULT FALSE`)
+pool.query(`
+  ALTER TABLE attendees ADD COLUMN IF NOT EXISTS is_gifted BOOLEAN DEFAULT FALSE;
+  ALTER TABLE attendees ADD COLUMN IF NOT EXISTS personalized_message TEXT;
+  ALTER TABLE attendees ADD COLUMN IF NOT EXISTS email_address VARCHAR(255);
+  ALTER TABLE attendees ADD COLUMN IF NOT EXISTS school VARCHAR(255);
+`)
   .then(() => console.log('✅ Migration check: is_gifted column ready'))
   .catch(err => console.error('Migration warning:', err.message));
 
 // Auto-migrate: add performance indexes for dashboard and program detail reads
 pool.query(`
   ALTER TABLE attendees ADD COLUMN IF NOT EXISTS is_gifted BOOLEAN DEFAULT FALSE;
+  ALTER TABLE attendees ADD COLUMN IF NOT EXISTS personalized_message TEXT;
+  ALTER TABLE attendees ADD COLUMN IF NOT EXISTS email_address VARCHAR(255);
+  ALTER TABLE attendees ADD COLUMN IF NOT EXISTS school VARCHAR(255);
   CREATE INDEX IF NOT EXISTS idx_attendees_program_time ON attendees(program_id, scan_time DESC);
   CREATE INDEX IF NOT EXISTS idx_attendees_program_winner_gifted ON attendees(program_id, is_winner, is_gifted);
 `)
