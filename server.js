@@ -69,6 +69,7 @@ const authRoutes = require('./routes/authRoutes');
 const programRoutes = require('./routes/programRoutes');
 const scanRoutes = require('./routes/scanRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
+const preEventRoutes = require('./routes/preEventRoutes');
 
 // API Routes
 app.get('/', (req, res) => {
@@ -79,6 +80,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/programs', programRoutes);
 app.use('/api/scan', scanRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/pre-events', preEventRoutes);
 
 // Socket.io connection
 io.on('connection', (socket) => {
@@ -234,6 +236,55 @@ pool.query(`
 `)
   .then(() => console.log('Migration check: event sponsor tables ready'))
   .catch(err => console.error('Migration warning (event sponsors):', err.message));
+
+// Auto-migrate: create pre-event RSVP tables if they don't exist
+pool.query(`
+  CREATE TABLE IF NOT EXISTS pre_events (
+    id SERIAL PRIMARY KEY,
+    church_id INTEGER NOT NULL REFERENCES churches(id) ON DELETE CASCADE,
+    title VARCHAR(255) NOT NULL,
+    event_date TIMESTAMP NOT NULL,
+    description TEXT,
+    banner_url TEXT,
+    banner_storage_path TEXT,
+    banner_original_name VARCHAR(255),
+    rsvp_fields JSONB NOT NULL DEFAULT '{"emailAddress":true}'::jsonb,
+    slug VARCHAR(160) UNIQUE NOT NULL,
+    is_rsvp_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE TABLE IF NOT EXISTS pre_event_rsvps (
+    id SERIAL PRIMARY KEY,
+    pre_event_id INTEGER NOT NULL REFERENCES pre_events(id) ON DELETE CASCADE,
+    email_address VARCHAR(255) NOT NULL,
+    full_name VARCHAR(255),
+    phone_number VARCHAR(50),
+    school VARCHAR(255),
+    organization VARCHAR(255),
+    ticket_type VARCHAR(120),
+    custom_answers JSONB DEFAULT '{}'::jsonb,
+    status VARCHAR(30) NOT NULL DEFAULT 'pre_registered',
+    registration_type VARCHAR(30) NOT NULL DEFAULT 'rsvp',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT pre_event_rsvps_status_check CHECK (status IN ('pre_registered')),
+    CONSTRAINT pre_event_rsvps_registration_type_check CHECK (registration_type IN ('rsvp'))
+  );
+  ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS banner_storage_path TEXT;
+  ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS banner_original_name VARCHAR(255);
+  ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS rsvp_fields JSONB NOT NULL DEFAULT '{"emailAddress":true}'::jsonb;
+  ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS is_rsvp_active BOOLEAN DEFAULT TRUE;
+  ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS custom_answers JSONB DEFAULT '{}'::jsonb;
+  ALTER TABLE pre_events ENABLE ROW LEVEL SECURITY;
+  ALTER TABLE pre_event_rsvps ENABLE ROW LEVEL SECURITY;
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_pre_event_rsvps_unique_email ON pre_event_rsvps(pre_event_id, email_address);
+  CREATE INDEX IF NOT EXISTS idx_pre_events_church_date ON pre_events(church_id, event_date DESC);
+  CREATE INDEX IF NOT EXISTS idx_pre_events_slug ON pre_events(slug);
+  CREATE INDEX IF NOT EXISTS idx_pre_event_rsvps_event_time ON pre_event_rsvps(pre_event_id, created_at DESC);
+`)
+  .then(() => console.log('Migration check: pre-event RSVP tables ready'))
+  .catch(err => console.error('Migration warning (pre-events):', err.message));
 
 // Auto-migrate: create notifications tables if they don't exist
 pool.query(`
