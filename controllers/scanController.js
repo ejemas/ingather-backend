@@ -196,6 +196,45 @@ const getSponsorsForProgram = async (programId) => {
   return result.rows.map(mapSponsor);
 };
 
+const buildAttendeeStats = async (db, programId) => {
+  const result = await db.query(
+    `SELECT
+      COUNT(*) as total,
+      COUNT(CASE WHEN sex = 'Male' THEN 1 END) as male_count,
+      COUNT(CASE WHEN sex = 'Female' THEN 1 END) as female_count,
+      COUNT(CASE WHEN first_timer = true THEN 1 END) as first_timer_count
+     FROM attendees
+     WHERE program_id = $1
+       AND status = 'checked_in'`,
+    [programId]
+  );
+
+  return {
+    attendeeMaleCount: parseInt(result.rows[0].male_count, 10),
+    attendeeFemaleCount: parseInt(result.rows[0].female_count, 10),
+    attendeeFirstTimerCount: parseInt(result.rows[0].first_timer_count, 10),
+    attendeeTotal: parseInt(result.rows[0].total, 10)
+  };
+};
+
+const mapFastTrackAttendee = (attendee) => ({
+  id: attendee.id,
+  fullName: attendee.full_name || '',
+  emailAddress: attendee.email_address || '',
+  school: attendee.school || '',
+  phoneNumber: attendee.phone_number || '',
+  address: attendee.address || '',
+  firstTimer: Boolean(attendee.first_timer),
+  department: attendee.department || '',
+  fellowship: attendee.fellowship || '',
+  age: attendee.age || '',
+  sex: attendee.sex || '',
+  status: attendee.status || 'checked_in',
+  registrationType: attendee.registration_type || 'rsvp',
+  checkedInAt: attendee.checked_in_at || attendee.scan_time,
+  scanTime: attendee.scan_time
+});
+
 const hashToPercentageBucket = (programId, deviceFingerprint) => {
   const hash = crypto
     .createHash('sha256')
@@ -394,6 +433,13 @@ exports.getProgramInfo = async (req, res) => {
     }
 
     const program = result.rows[0];
+    const linkedPreEventResult = await pool.query(
+      `SELECT id
+       FROM pre_events
+       WHERE program_id = $1
+       LIMIT 1`,
+      [programId]
+    );
 
     return res.json({
       id: program.id,
@@ -416,6 +462,7 @@ exports.getProgramInfo = async (req, res) => {
       sponsorDisplayMode: program.sponsor_display_mode || 'carousel',
       proxyCheckinEnabled: program.proxy_checkin_enabled || false,
       strictDeviceFingerprinting: program.strict_device_fingerprinting !== false,
+      fastTrackRsvpEnabled: program.tracking_mode === 'collect-data' && linkedPreEventResult.rows.length > 0,
       isActive: program.is_active
     });
   } catch (error) {
@@ -499,8 +546,8 @@ exports.submitFormData = async (req, res) => {
 
     await client.query(
       `INSERT INTO attendees
-       (program_id, full_name, email_address, school, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id, personalized_message)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+       (program_id, full_name, email_address, school, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id, personalized_message, status, registration_type, checked_in_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'checked_in', 'walk_in', CURRENT_TIMESTAMP)`,
       [
         programId,
         formData.fullName || null,
@@ -562,6 +609,213 @@ exports.submitFormData = async (req, res) => {
       return res.status(400).json({ error: 'Form already submitted for this scan' });
     }
     return res.status(500).json({ error: 'Server error submitting form' });
+  } finally {
+    client.release();
+  }
+};
+
+// Fast-track a pre-registered RSVP attendee into the live check-in table.
+exports.submitFastTrackRsvp = async (req, res) => {
+  const client = await pool.connect();
+  let transactionStarted = false;
+
+  try {
+    const { programId } = req.params;
+    const { deviceFingerprint } = req.body;
+    const emailAddress = normalizeCollectedEmail(req.body.emailAddress);
+
+    if (!isValidCollectedEmail(emailAddress)) {
+      return res.status(400).json({ error: 'A valid email address is required.' });
+    }
+
+    await client.query('BEGIN');
+    transactionStarted = true;
+
+    const programResult = await client.query(
+      'SELECT * FROM programs WHERE id = $1',
+      [programId]
+    );
+
+    if (programResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(404).json({ error: 'Program not found' });
+    }
+
+    const program = programResult.rows[0];
+
+    if (!program.is_active) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(400).json({ error: 'This program is no longer active' });
+    }
+
+    if (program.tracking_mode !== 'collect-data') {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(400).json({ error: 'Fast-track check-in is only available for collect-data programs' });
+    }
+
+    const session = await verifyScanSession(client, programId, getScanSessionId(req), deviceFingerprint, getScanSessionToken(req));
+    if (session.error) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(session.status).json({ error: session.error });
+    }
+
+    const attendeeCheck = await client.query(
+      'SELECT id FROM attendees WHERE scan_id = $1',
+      [session.scan.id]
+    );
+
+    if (attendeeCheck.rows.length > 0) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(400).json({ error: 'Check-in already completed for this scan' });
+    }
+
+    const rsvpResult = await client.query(
+      `SELECT per.*
+       FROM pre_event_rsvps per
+       JOIN pre_events pe ON pe.id = per.pre_event_id
+       WHERE pe.program_id = $1
+         AND per.email_address = $2
+       ORDER BY pe.event_date DESC, per.created_at DESC
+       LIMIT 1
+       FOR UPDATE OF per`,
+      [programId, emailAddress]
+    );
+
+    if (rsvpResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(404).json({
+        error: 'No pre-registration was found for this email. Please complete the full check-in form.',
+        fastTrackNotFound: true
+      });
+    }
+
+    const rsvp = rsvpResult.rows[0];
+
+    if (rsvp.status === 'checked_in') {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(409).json({
+        error: 'This RSVP has already checked in.',
+        alreadyCheckedIn: true
+      });
+    }
+
+    const existingRsvpAttendee = await client.query(
+      'SELECT id FROM attendees WHERE pre_event_rsvp_id = $1 LIMIT 1',
+      [rsvp.id]
+    );
+
+    if (existingRsvpAttendee.rows.length > 0) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(409).json({
+        error: 'This RSVP has already checked in.',
+        alreadyCheckedIn: true
+      });
+    }
+
+    const attendeeFormData = {
+      fullName: rsvp.full_name || '',
+      emailAddress: rsvp.email_address || '',
+      school: rsvp.school || '',
+      phoneNumber: rsvp.phone_number || '',
+      address: rsvp.address || '',
+      firstTimer: Boolean(rsvp.first_timer),
+      department: rsvp.department || '',
+      fellowship: rsvp.fellowship || '',
+      age: rsvp.age || '',
+      sex: rsvp.sex || ''
+    };
+    const personalizedMessage = selectPersonalizedMessage(program, attendeeFormData);
+    const checkedInAt = new Date();
+
+    await client.query(
+      `UPDATE scans
+       SET gender = $1,
+           first_timer = $2
+       WHERE id = $3 AND program_id = $4`,
+      [
+        rsvp.sex ? String(rsvp.sex).toLowerCase() : null,
+        Boolean(rsvp.first_timer),
+        session.scan.id,
+        programId
+      ]
+    );
+
+    const attendeeResult = await client.query(
+      `INSERT INTO attendees
+       (program_id, full_name, email_address, school, phone_number, address, first_timer,
+        department, fellowship, age, sex, is_winner, device_fingerprint, scan_id,
+        personalized_message, pre_event_rsvp_id, status, registration_type, checked_in_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, false, $12, $13, $14, $15, 'checked_in', 'rsvp', $16)
+       RETURNING *`,
+      [
+        programId,
+        cleanText(rsvp.full_name) || null,
+        emailAddress,
+        cleanText(rsvp.school) || null,
+        cleanText(rsvp.phone_number) || null,
+        cleanText(rsvp.address) || null,
+        Boolean(rsvp.first_timer),
+        cleanText(rsvp.department) || null,
+        cleanText(rsvp.fellowship) || null,
+        rsvp.age || null,
+        cleanText(rsvp.sex) || null,
+        session.deviceFingerprint,
+        session.scan.id,
+        personalizedMessage,
+        rsvp.id,
+        checkedInAt
+      ]
+    );
+
+    await client.query(
+      `UPDATE pre_event_rsvps
+       SET status = 'checked_in',
+           checked_in_at = $1,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2`,
+      [checkedInAt, rsvp.id]
+    );
+
+    const attendeeStats = await buildAttendeeStats(client, programId);
+    const sharedDeviceCheckins = await getSharedDeviceCheckins(client, programId);
+
+    await client.query('COMMIT');
+    transactionStarted = false;
+
+    const io = req.app.get('io');
+    io?.emit(`program-${programId}-update`, {
+      ...attendeeStats,
+      sharedDeviceCheckins,
+      timestamp: new Date()
+    });
+
+    const sponsorPlacement = await buildSponsorPlacement(programId, program.sponsor_display_mode || 'carousel', session.deviceFingerprint);
+
+    return res.status(201).json({
+      success: true,
+      fastTrack: true,
+      attendee: mapFastTrackAttendee(attendeeResult.rows[0]),
+      isWinner: false,
+      giftingEnabled: false,
+      personalizedMessage,
+      sharedDeviceCheckins,
+      sponsorPlacement
+    });
+  } catch (error) {
+    if (transactionStarted) await client.query('ROLLBACK');
+    console.error('Fast-track RSVP check-in error:', error);
+    if (error.code === '23505') {
+      return res.status(409).json({ error: 'This RSVP has already checked in.', alreadyCheckedIn: true });
+    }
+    return res.status(500).json({ error: 'Server error completing fast-track check-in' });
   } finally {
     client.release();
   }
@@ -684,8 +938,8 @@ exports.submitProxyAttendee = async (req, res) => {
 
     const attendeeResult = await client.query(
       `INSERT INTO attendees
-       (program_id, full_name, email_address, school, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, proxy_host_fingerprint, scan_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, false, $12, $13, $14)
+       (program_id, full_name, email_address, school, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, proxy_host_fingerprint, scan_id, status, registration_type, checked_in_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, false, $12, $13, $14, 'checked_in', 'proxy', CURRENT_TIMESTAMP)
        RETURNING *`,
       [
         programId,

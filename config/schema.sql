@@ -109,6 +109,10 @@ CREATE TABLE IF NOT EXISTS attendees (
     device_fingerprint VARCHAR(500) NOT NULL,
     proxy_host_fingerprint VARCHAR(500),
     scan_id INTEGER,
+    pre_event_rsvp_id INTEGER,
+    status VARCHAR(30) NOT NULL DEFAULT 'checked_in',
+    registration_type VARCHAR(30) NOT NULL DEFAULT 'walk_in',
+    checked_in_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     scan_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -129,6 +133,7 @@ CREATE TABLE IF NOT EXISTS scans (
 CREATE TABLE IF NOT EXISTS pre_events (
     id SERIAL PRIMARY KEY,
     church_id INTEGER NOT NULL REFERENCES churches(id) ON DELETE CASCADE,
+    program_id INTEGER REFERENCES programs(id) ON DELETE SET NULL,
     title VARCHAR(255) NOT NULL,
     event_date TIMESTAMP NOT NULL,
     description TEXT,
@@ -152,17 +157,58 @@ CREATE TABLE IF NOT EXISTS pre_event_rsvps (
     school VARCHAR(255),
     organization VARCHAR(255),
     ticket_type VARCHAR(120),
+    address TEXT,
+    first_timer BOOLEAN DEFAULT FALSE,
+    department VARCHAR(100),
+    fellowship VARCHAR(100),
+    age INTEGER,
+    sex VARCHAR(20),
     custom_answers JSONB DEFAULT '{}'::jsonb,
     status VARCHAR(30) NOT NULL DEFAULT 'pre_registered',
     registration_type VARCHAR(30) NOT NULL DEFAULT 'rsvp',
+    checked_in_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT pre_event_rsvps_status_check CHECK (status IN ('pre_registered')),
+    CONSTRAINT pre_event_rsvps_status_check CHECK (status IN ('pre_registered', 'checked_in')),
     CONSTRAINT pre_event_rsvps_registration_type_check CHECK (registration_type IN ('rsvp'))
 );
 
 ALTER TABLE pre_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pre_event_rsvps ENABLE ROW LEVEL SECURITY;
+
+ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS program_id INTEGER REFERENCES programs(id) ON DELETE SET NULL;
+ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checked_in_at TIMESTAMP;
+ALTER TABLE attendees ADD COLUMN IF NOT EXISTS pre_event_rsvp_id INTEGER REFERENCES pre_event_rsvps(id) ON DELETE SET NULL;
+ALTER TABLE attendees ADD COLUMN IF NOT EXISTS status VARCHAR(30) NOT NULL DEFAULT 'checked_in';
+ALTER TABLE attendees ADD COLUMN IF NOT EXISTS registration_type VARCHAR(30) NOT NULL DEFAULT 'walk_in';
+ALTER TABLE attendees ADD COLUMN IF NOT EXISTS checked_in_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+UPDATE attendees SET status = 'checked_in' WHERE status IS NULL;
+UPDATE attendees SET registration_type = CASE
+    WHEN proxy_host_fingerprint IS NOT NULL THEN 'proxy'
+    WHEN device_fingerprint LIKE 'manual-%' THEN 'manual'
+    ELSE COALESCE(registration_type, 'walk_in')
+END
+WHERE registration_type IS NULL OR registration_type = 'walk_in';
+UPDATE attendees SET checked_in_at = COALESCE(checked_in_at, scan_time, CURRENT_TIMESTAMP);
+
+ALTER TABLE attendees DROP CONSTRAINT IF EXISTS attendees_status_check;
+ALTER TABLE attendees ADD CONSTRAINT attendees_status_check CHECK (status IN ('pre_registered', 'checked_in'));
+ALTER TABLE attendees DROP CONSTRAINT IF EXISTS attendees_registration_type_check;
+ALTER TABLE attendees ADD CONSTRAINT attendees_registration_type_check CHECK (registration_type IN ('rsvp', 'walk_in', 'manual', 'proxy'));
+ALTER TABLE pre_event_rsvps DROP CONSTRAINT IF EXISTS pre_event_rsvps_status_check;
+ALTER TABLE pre_event_rsvps ADD CONSTRAINT pre_event_rsvps_status_check CHECK (status IN ('pre_registered', 'checked_in'));
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'attendees_pre_event_rsvp_id_fkey'
+  ) THEN
+    ALTER TABLE attendees
+      ADD CONSTRAINT attendees_pre_event_rsvp_id_fkey
+      FOREIGN KEY (pre_event_rsvp_id) REFERENCES pre_event_rsvps(id) ON DELETE SET NULL;
+  END IF;
+END;
+$$;
 
 ALTER TABLE programs ADD COLUMN IF NOT EXISTS strict_device_fingerprinting BOOLEAN DEFAULT TRUE;
 ALTER TABLE programs ALTER COLUMN strict_device_fingerprinting SET DEFAULT TRUE;
@@ -202,6 +248,11 @@ CREATE INDEX IF NOT EXISTS idx_event_sponsors_program_active ON event_sponsors(p
 CREATE INDEX IF NOT EXISTS idx_sponsor_click_events_program_time ON sponsor_click_events(program_id, clicked_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sponsor_click_events_sponsor_time ON sponsor_click_events(sponsor_id, clicked_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pre_event_rsvps_unique_email ON pre_event_rsvps(pre_event_id, email_address);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_attendees_pre_event_rsvp_unique
+    ON attendees(pre_event_rsvp_id)
+    WHERE pre_event_rsvp_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_pre_events_program_id ON pre_events(program_id);
+CREATE INDEX IF NOT EXISTS idx_attendees_program_checked_in ON attendees(program_id, checked_in_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pre_events_church_date ON pre_events(church_id, event_date DESC);
 CREATE INDEX IF NOT EXISTS idx_pre_events_slug ON pre_events(slug);
 CREATE INDEX IF NOT EXISTS idx_pre_event_rsvps_event_time ON pre_event_rsvps(pre_event_id, created_at DESC);

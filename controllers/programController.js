@@ -256,6 +256,10 @@ const mapAttendee = (attendee) => ({
   personalizedMessage: attendee.personalized_message || null,
   proxyHostFingerprint: attendee.proxy_host_fingerprint || null,
   scanId: attendee.scan_id || null,
+  preEventRsvpId: attendee.pre_event_rsvp_id || null,
+  status: attendee.status || 'checked_in',
+  registrationType: attendee.registration_type || (attendee.proxy_host_fingerprint ? 'proxy' : attendee.device_fingerprint?.startsWith('manual-') ? 'manual' : 'walk_in'),
+  checkedInAt: attendee.checked_in_at || attendee.scan_time,
   scanTime: attendee.scan_time
 });
 
@@ -949,7 +953,14 @@ exports.getProgramDetailBootstrap = async (req, res) => {
       pool.query('SELECT COUNT(*) FROM attendees WHERE program_id = $1', [id]),
       pool.query('SELECT COUNT(*) FROM attendees WHERE program_id = $1 AND first_timer = true', [id]),
       pool.query('SELECT COUNT(*) FROM attendees WHERE program_id = $1 AND is_winner = true AND is_gifted = true', [id]),
-      pool.query('SELECT * FROM attendees WHERE program_id = $1 ORDER BY scan_time DESC', [id]),
+      pool.query(
+        `SELECT *
+         FROM attendees
+         WHERE program_id = $1
+           AND status = 'checked_in'
+         ORDER BY COALESCE(checked_in_at, scan_time) DESC`,
+        [id]
+      ),
       buildAttendanceOverTimePayload(id, program),
       isCountOnly ? buildCountOnlyStatsPayload(id) : Promise.resolve(null),
       isCountOnly
@@ -1057,7 +1068,11 @@ exports.getAttendees = async (req, res) => {
     }
 
     const result = await pool.query(
-      'SELECT * FROM attendees WHERE program_id = $1 ORDER BY scan_time DESC',
+      `SELECT *
+       FROM attendees
+       WHERE program_id = $1
+         AND status = 'checked_in'
+       ORDER BY COALESCE(checked_in_at, scan_time) DESC`,
       [id]
     );
 
@@ -1166,8 +1181,8 @@ exports.addManualAttendee = async (req, res) => {
 
     const attendeeResult = await client.query(
       `INSERT INTO attendees
-       (program_id, full_name, email_address, school, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+       (program_id, full_name, email_address, school, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id, status, registration_type, checked_in_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'checked_in', 'manual', CURRENT_TIMESTAMP)
        RETURNING *`,
       [
         id,

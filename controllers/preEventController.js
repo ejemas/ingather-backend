@@ -10,10 +10,28 @@ const RSVP_FIELD_LABELS = {
   phoneNumber: 'Phone Number',
   school: 'School',
   organization: 'Organization',
-  ticketType: 'Ticket Type'
+  ticketType: 'Ticket Type',
+  address: 'Address',
+  firstTimer: 'First-Timer',
+  department: 'Department',
+  fellowship: 'Group',
+  age: 'Age',
+  sex: 'Gender'
 };
 
-const OPTIONAL_RSVP_FIELDS = ['fullName', 'phoneNumber', 'school', 'organization', 'ticketType'];
+const OPTIONAL_RSVP_FIELDS = [
+  'fullName',
+  'phoneNumber',
+  'school',
+  'organization',
+  'ticketType',
+  'address',
+  'firstTimer',
+  'department',
+  'fellowship',
+  'age',
+  'sex'
+];
 
 const trimTrailingSlash = (value) => String(value || '').replace(/\/+$/, '');
 
@@ -67,8 +85,15 @@ const parseEventDate = (value) => {
   return date;
 };
 
+const normalizeProgramId = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+};
+
 const mapPreEvent = (row, extras = {}) => ({
   id: row.id,
+  programId: row.program_id || null,
   title: row.title,
   eventDate: row.event_date,
   description: row.description || '',
@@ -92,9 +117,16 @@ const mapRsvp = (row) => ({
   school: row.school || '',
   organization: row.organization || '',
   ticketType: row.ticket_type || '',
+  address: row.address || '',
+  firstTimer: Boolean(row.first_timer),
+  department: row.department || '',
+  fellowship: row.fellowship || '',
+  age: row.age,
+  sex: row.sex || '',
   customAnswers: row.custom_answers || {},
   status: row.status || 'pre_registered',
   registrationType: row.registration_type || 'rsvp',
+  checkedInAt: row.checked_in_at || null,
   createdAt: row.created_at
 });
 
@@ -104,6 +136,22 @@ const getOwnedPreEventRow = async (churchId, id) => {
     [id, churchId]
   );
   return result.rows[0] || null;
+};
+
+const validateLinkedProgram = async (churchId, programId) => {
+  const normalizedProgramId = normalizeProgramId(programId);
+  if (!normalizedProgramId) return null;
+
+  const result = await pool.query(
+    'SELECT id FROM programs WHERE id = $1 AND church_id = $2 LIMIT 1',
+    [normalizedProgramId, churchId]
+  );
+
+  if (result.rows.length === 0) {
+    throw new Error('Linked live program was not found in this workspace.');
+  }
+
+  return normalizedProgramId;
 };
 
 const validateRsvpPayload = (fields, formData = {}) => {
@@ -120,14 +168,46 @@ const validateRsvpPayload = (fields, formData = {}) => {
     phoneNumber: null,
     school: null,
     organization: null,
-    ticketType: null
+    ticketType: null,
+    address: null,
+    firstTimer: false,
+    department: null,
+    fellowship: null,
+    age: null,
+    sex: null
   };
 
   OPTIONAL_RSVP_FIELDS.forEach((field) => {
-    const value = cleanText(formData[field], field === 'phoneNumber' ? 50 : 255);
+    if (field === 'firstTimer') {
+      payload.firstTimer = Boolean(formData.firstTimer);
+      return;
+    }
+
+    if (field === 'age') {
+      const rawAge = String(formData.age ?? '').trim();
+      if (normalizedFields.age && !rawAge) {
+        throw new Error('Age is required.');
+      }
+      if (rawAge) {
+        const age = Number(rawAge);
+        if (!Number.isInteger(age) || age < 1 || age > 120) {
+          throw new Error('Age must be a number between 1 and 120.');
+        }
+        payload.age = age;
+      }
+      return;
+    }
+
+    const maxLength = field === 'phoneNumber' ? 50 : field === 'address' ? 1000 : 255;
+    const value = cleanText(formData[field], maxLength);
     if (normalizedFields[field] && !value) {
       throw new Error(`${RSVP_FIELD_LABELS[field]} is required.`);
     }
+
+    if (field === 'sex' && value && !['Male', 'Female', 'Other'].includes(value)) {
+      throw new Error('Please select a valid gender.');
+    }
+
     payload[field] = value || null;
   });
 
@@ -162,6 +242,7 @@ exports.createPreEvent = async (req, res) => {
     const description = cleanText(req.body.description, 5000);
     const rsvpFields = normalizeRsvpFields(req.body.rsvpFields);
     const isRsvpActive = req.body.isRsvpActive !== false;
+    const linkedProgramId = await validateLinkedProgram(req.churchId, req.body.programId);
 
     if (!title) {
       return res.status(400).json({ error: 'Event name is required.' });
@@ -183,13 +264,14 @@ exports.createPreEvent = async (req, res) => {
 
     const result = await pool.query(
       `INSERT INTO pre_events (
-        church_id, title, event_date, description, banner_url, banner_storage_path,
+        church_id, program_id, title, event_date, description, banner_url, banner_storage_path,
         banner_original_name, rsvp_fields, slug, is_rsvp_active
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)
       RETURNING *`,
       [
         req.churchId,
+        linkedProgramId,
         title,
         eventDate,
         description || null,
@@ -210,8 +292,9 @@ exports.createPreEvent = async (req, res) => {
       });
     }
 
+    const isValidationError = /Linked live program/i.test(error.message || '');
     console.error('Create pre-event error:', error);
-    return res.status(500).json({ error: error.message || 'Server error creating pre-event.' });
+    return res.status(isValidationError ? 400 : 500).json({ error: error.message || 'Server error creating pre-event.' });
   }
 };
 
@@ -293,6 +376,9 @@ exports.updatePreEvent = async (req, res) => {
     const eventDate = parseEventDate(req.body.eventDate ?? existing.event_date);
     const description = cleanText(req.body.description ?? existing.description, 5000);
     const rsvpFields = normalizeRsvpFields(req.body.rsvpFields || existing.rsvp_fields);
+    const linkedProgramId = Object.prototype.hasOwnProperty.call(req.body, 'programId')
+      ? await validateLinkedProgram(req.churchId, req.body.programId)
+      : existing.program_id || null;
     const isRsvpActive = typeof req.body.isRsvpActive === 'boolean'
       ? req.body.isRsvpActive
       : existing.is_rsvp_active !== false;
@@ -316,18 +402,20 @@ exports.updatePreEvent = async (req, res) => {
     const result = await pool.query(
       `UPDATE pre_events
        SET title = $1,
-           event_date = $2,
-           description = $3,
-           banner_url = COALESCE($4, banner_url),
-           banner_storage_path = COALESCE($5, banner_storage_path),
-           banner_original_name = COALESCE($6, banner_original_name),
-           rsvp_fields = $7::jsonb,
-           is_rsvp_active = $8,
+           program_id = $2,
+           event_date = $3,
+           description = $4,
+           banner_url = COALESCE($5, banner_url),
+           banner_storage_path = COALESCE($6, banner_storage_path),
+           banner_original_name = COALESCE($7, banner_original_name),
+           rsvp_fields = $8::jsonb,
+           is_rsvp_active = $9,
            updated_at = CURRENT_TIMESTAMP
-       WHERE id = $9 AND church_id = $10
+       WHERE id = $10 AND church_id = $11
        RETURNING *`,
       [
         title,
+        linkedProgramId,
         eventDate,
         description || null,
         uploadedBanner?.flyerUrl || null,
@@ -354,8 +442,9 @@ exports.updatePreEvent = async (req, res) => {
       });
     }
 
+    const isValidationError = /Linked live program/i.test(error.message || '');
     console.error('Update pre-event error:', error);
-    return res.status(500).json({ error: error.message || 'Server error updating pre-event.' });
+    return res.status(isValidationError ? 400 : 500).json({ error: error.message || 'Server error updating pre-event.' });
   }
 };
 
@@ -422,9 +511,10 @@ exports.submitPublicRsvp = async (req, res) => {
     const result = await pool.query(
       `INSERT INTO pre_event_rsvps (
         pre_event_id, email_address, full_name, phone_number, school,
-        organization, ticket_type, status, registration_type
+        organization, ticket_type, address, first_timer, department, fellowship,
+        age, sex, status, registration_type
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, 'pre_registered', 'rsvp')
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'pre_registered', 'rsvp')
       RETURNING *`,
       [
         preEvent.id,
@@ -433,7 +523,13 @@ exports.submitPublicRsvp = async (req, res) => {
         payload.phoneNumber,
         payload.school,
         payload.organization,
-        payload.ticketType
+        payload.ticketType,
+        payload.address,
+        payload.firstTimer,
+        payload.department,
+        payload.fellowship,
+        payload.age,
+        payload.sex
       ]
     );
 
@@ -447,7 +543,7 @@ exports.submitPublicRsvp = async (req, res) => {
       return res.status(409).json({ error: 'This email has already secured access for this event.' });
     }
 
-    const isValidationError = /required|valid email/i.test(error.message || '');
+    const isValidationError = /required|valid email|age must|valid gender/i.test(error.message || '');
     if (isValidationError) {
       return res.status(400).json({ error: error.message });
     }

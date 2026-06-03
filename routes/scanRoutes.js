@@ -91,6 +91,9 @@ router.post('/program/:programId', ...scanWriteLimiters, scanController.scanQR);
 // Submit form data only (public)
 router.post('/program/:programId/form', ...scanWriteLimiters, scanController.submitFormData);
 
+// Fast-track a pre-registered RSVP attendee (public)
+router.post('/program/:programId/fast-track', ...scanWriteLimiters, scanController.submitFastTrackRsvp);
+
 // Submit proxy attendee check-in (public)
 router.post('/program/:programId/proxy', ...scanWriteLimiters, scanController.submitProxyAttendee);
 
