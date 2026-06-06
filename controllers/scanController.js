@@ -44,6 +44,27 @@ const isValidCollectedEmail = (value) => {
     && email.indexOf('@') === email.lastIndexOf('@');
 };
 
+const DEFAULT_TEXTAREA_LABEL = 'Additional Response';
+
+const normalizeFieldConfig = (config = {}) => ({
+  textareaLabel: typeof config.textareaLabel === 'string' && config.textareaLabel.trim()
+    ? config.textareaLabel.trim().slice(0, 120)
+    : DEFAULT_TEXTAREA_LABEL
+});
+
+const normalizeUrlField = (value) => {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!raw) return '';
+
+  try {
+    const url = new URL(raw);
+    if (!['http:', 'https:'].includes(url.protocol)) return '';
+    return url.toString();
+  } catch (error) {
+    return '';
+  }
+};
+
 const getScanSessionToken = (req) => {
   return req.body?.scanSessionToken || req.get('x-scan-session-token');
 };
@@ -222,6 +243,8 @@ const mapFastTrackAttendee = (attendee) => ({
   fullName: attendee.full_name || '',
   emailAddress: attendee.email_address || '',
   school: attendee.school || '',
+  linkUrl: attendee.link_url || '',
+  textareaResponse: attendee.textarea_response || '',
   phoneNumber: attendee.phone_number || '',
   address: attendee.address || '',
   firstTimer: Boolean(attendee.first_timer),
@@ -451,6 +474,7 @@ exports.getProgramInfo = async (req, res) => {
       endTime: program.end_time,
       trackingMode: program.tracking_mode,
       dataFields: program.data_fields,
+      dataFieldConfig: normalizeFieldConfig(program.data_field_config || {}),
       giftingEnabled: program.gifting_enabled,
       totalWinners: program.total_winners,
       winnersSelected: program.winners_selected,
@@ -522,6 +546,8 @@ exports.submitFormData = async (req, res) => {
       else if (!isValidCollectedEmail(formData.emailAddress)) errors.emailAddress = 'Enter a valid email address';
     }
     if (dataFields.school && !cleanText(formData.school)) errors.school = 'School is required';
+    if (dataFields.link && !normalizeUrlField(formData.linkUrl || formData.link)) errors.linkUrl = 'Enter a valid link starting with http:// or https://';
+    if (dataFields.textarea && !cleanText(formData.textareaResponse)) errors.textareaResponse = 'Response is required';
 
     if (Object.keys(errors).length > 0) {
       await client.query('ROLLBACK');
@@ -532,6 +558,8 @@ exports.submitFormData = async (req, res) => {
     const personalizedMessage = selectPersonalizedMessage(program, formData);
     const emailAddress = dataFields.emailAddress ? normalizeCollectedEmail(formData.emailAddress) : null;
     const school = dataFields.school ? cleanText(formData.school) : null;
+    const linkUrl = dataFields.link ? normalizeUrlField(formData.linkUrl || formData.link) : null;
+    const textareaResponse = dataFields.textarea ? cleanText(formData.textareaResponse).slice(0, 5000) : null;
 
     if (program.gifting_enabled && program.winners_selected < program.total_winners) {
       isWinner = Math.random() > 0.5;
@@ -546,13 +574,15 @@ exports.submitFormData = async (req, res) => {
 
     await client.query(
       `INSERT INTO attendees
-       (program_id, full_name, email_address, school, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id, personalized_message, status, registration_type, checked_in_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'checked_in', 'walk_in', CURRENT_TIMESTAMP)`,
+       (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id, personalized_message, status, registration_type, checked_in_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'checked_in', 'walk_in', CURRENT_TIMESTAMP)`,
       [
         programId,
         formData.fullName || null,
         emailAddress,
         school,
+        linkUrl,
+        textareaResponse,
         formData.phoneNumber || null,
         formData.address || null,
         formData.firstTimer || false,
@@ -724,6 +754,8 @@ exports.submitFastTrackRsvp = async (req, res) => {
       fullName: rsvp.full_name || '',
       emailAddress: rsvp.email_address || '',
       school: rsvp.school || '',
+      linkUrl: rsvp.link_url || '',
+      textareaResponse: rsvp.textarea_response || '',
       phoneNumber: rsvp.phone_number || '',
       address: rsvp.address || '',
       firstTimer: Boolean(rsvp.first_timer),
@@ -750,16 +782,18 @@ exports.submitFastTrackRsvp = async (req, res) => {
 
     const attendeeResult = await client.query(
       `INSERT INTO attendees
-       (program_id, full_name, email_address, school, phone_number, address, first_timer,
+       (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer,
         department, fellowship, age, sex, is_winner, device_fingerprint, scan_id,
         personalized_message, pre_event_rsvp_id, status, registration_type, checked_in_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, false, $12, $13, $14, $15, 'checked_in', 'rsvp', $16)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false, $14, $15, $16, $17, 'checked_in', 'rsvp', $18)
        RETURNING *`,
       [
         programId,
         cleanText(rsvp.full_name) || null,
         emailAddress,
         cleanText(rsvp.school) || null,
+        cleanText(rsvp.link_url) || null,
+        cleanText(rsvp.textarea_response).slice(0, 5000) || null,
         cleanText(rsvp.phone_number) || null,
         cleanText(rsvp.address) || null,
         Boolean(rsvp.first_timer),
@@ -898,6 +932,8 @@ exports.submitProxyAttendee = async (req, res) => {
       else if (!isValidCollectedEmail(formData.emailAddress)) errors.emailAddress = 'Enter a valid email address';
     }
     if (dataFields.school && !cleanText(formData.school)) errors.school = 'School is required';
+    if (dataFields.link && !normalizeUrlField(formData.linkUrl || formData.link)) errors.linkUrl = 'Enter a valid link starting with http:// or https://';
+    if (dataFields.textarea && !cleanText(formData.textareaResponse)) errors.textareaResponse = 'Response is required';
     if (dataFields.phoneNumber && !cleanText(formData.phoneNumber)) errors.phoneNumber = 'Phone number is required';
     if (dataFields.address && !cleanText(formData.address)) errors.address = 'Address is required';
     if (dataFields.department && !cleanText(formData.department)) errors.department = 'Department is required';
@@ -922,6 +958,8 @@ exports.submitProxyAttendee = async (req, res) => {
     const sex = cleanText(formData.sex) || null;
     const emailAddress = dataFields.emailAddress ? normalizeCollectedEmail(formData.emailAddress) : null;
     const school = dataFields.school ? cleanText(formData.school) : null;
+    const linkUrl = dataFields.link ? normalizeUrlField(formData.linkUrl || formData.link) : null;
+    const textareaResponse = dataFields.textarea ? cleanText(formData.textareaResponse).slice(0, 5000) : null;
 
     const scanResult = await client.query(
       `INSERT INTO scans
@@ -938,14 +976,16 @@ exports.submitProxyAttendee = async (req, res) => {
 
     const attendeeResult = await client.query(
       `INSERT INTO attendees
-       (program_id, full_name, email_address, school, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, proxy_host_fingerprint, scan_id, status, registration_type, checked_in_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, false, $12, $13, $14, 'checked_in', 'proxy', CURRENT_TIMESTAMP)
+       (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, proxy_host_fingerprint, scan_id, status, registration_type, checked_in_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false, $14, $15, $16, 'checked_in', 'proxy', CURRENT_TIMESTAMP)
        RETURNING *`,
       [
         programId,
         cleanText(formData.fullName) || null,
         emailAddress,
         school,
+        linkUrl,
+        textareaResponse,
         cleanText(formData.phoneNumber) || null,
         cleanText(formData.address) || null,
         firstTimer,

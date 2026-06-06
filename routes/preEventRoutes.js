@@ -12,6 +12,7 @@ const preEventValidators = [
   body('description').optional({ nullable: true }).isString().withMessage('Description must be text'),
   body('programId').optional({ nullable: true, checkFalsy: true }).isInt().withMessage('Linked program must be a valid program'),
   body('rsvpFields').optional().isObject().withMessage('RSVP fields must be an object'),
+  body('rsvpFieldConfig').optional().isObject().withMessage('RSVP field config must be an object'),
   body('isRsvpActive').optional().isBoolean().withMessage('RSVP active value must be true or false')
 ];
 

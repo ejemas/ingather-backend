@@ -15,6 +15,7 @@ router.post(
     body('startTime').notEmpty().withMessage('Start time is required'),
     body('endTime').notEmpty().withMessage('End time is required'),
     body('trackingMode').isIn(['count-only', 'collect-data']).withMessage('Invalid tracking mode'),
+    body('dataFieldConfig').optional().isObject().withMessage('Data field config must be an object'),
     body('flyerType').optional().isIn(['standard', 'personalized']).withMessage('Invalid flyer type'),
     body('sponsorDisplayMode').optional().isIn(['carousel', 'distribution']).withMessage('Invalid sponsor display mode'),
     body('strictDeviceFingerprinting').optional().isBoolean().withMessage('Invalid strict device fingerprinting value'),

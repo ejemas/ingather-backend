@@ -127,6 +127,8 @@ pool.query(`
   ALTER TABLE attendees ADD COLUMN IF NOT EXISTS personalized_message TEXT;
   ALTER TABLE attendees ADD COLUMN IF NOT EXISTS email_address VARCHAR(255);
   ALTER TABLE attendees ADD COLUMN IF NOT EXISTS school VARCHAR(255);
+  ALTER TABLE attendees ADD COLUMN IF NOT EXISTS link_url TEXT;
+  ALTER TABLE attendees ADD COLUMN IF NOT EXISTS textarea_response TEXT;
 `)
   .then(() => console.log('✅ Migration check: is_gifted column ready'))
   .catch(err => console.error('Migration warning:', err.message));
@@ -137,6 +139,8 @@ pool.query(`
   ALTER TABLE attendees ADD COLUMN IF NOT EXISTS personalized_message TEXT;
   ALTER TABLE attendees ADD COLUMN IF NOT EXISTS email_address VARCHAR(255);
   ALTER TABLE attendees ADD COLUMN IF NOT EXISTS school VARCHAR(255);
+  ALTER TABLE attendees ADD COLUMN IF NOT EXISTS link_url TEXT;
+  ALTER TABLE attendees ADD COLUMN IF NOT EXISTS textarea_response TEXT;
   CREATE INDEX IF NOT EXISTS idx_attendees_program_time ON attendees(program_id, scan_time DESC);
   CREATE INDEX IF NOT EXISTS idx_attendees_program_winner_gifted ON attendees(program_id, is_winner, is_gifted);
 `)
@@ -157,6 +161,7 @@ pool.query(`
 // Auto-migrate: add proxy check-in columns
 pool.query(`
   ALTER TABLE programs ADD COLUMN IF NOT EXISTS proxy_checkin_enabled BOOLEAN DEFAULT FALSE;
+  ALTER TABLE programs ADD COLUMN IF NOT EXISTS data_field_config JSONB DEFAULT '{}'::jsonb;
   ALTER TABLE scans ADD COLUMN IF NOT EXISTS proxy_host_fingerprint VARCHAR(500);
   ALTER TABLE attendees ADD COLUMN IF NOT EXISTS proxy_host_fingerprint VARCHAR(500);
   CREATE INDEX IF NOT EXISTS idx_attendees_proxy_host ON attendees(program_id, proxy_host_fingerprint);
@@ -250,6 +255,7 @@ pool.query(`
     banner_storage_path TEXT,
     banner_original_name VARCHAR(255),
     rsvp_fields JSONB NOT NULL DEFAULT '{"emailAddress":true}'::jsonb,
+    rsvp_field_config JSONB DEFAULT '{}'::jsonb,
     slug VARCHAR(160) UNIQUE NOT NULL,
     is_rsvp_active BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -262,6 +268,8 @@ pool.query(`
     full_name VARCHAR(255),
     phone_number VARCHAR(50),
     school VARCHAR(255),
+    link_url TEXT,
+    textarea_response TEXT,
     organization VARCHAR(255),
     ticket_type VARCHAR(120),
     address TEXT,
@@ -283,8 +291,11 @@ pool.query(`
   ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS banner_storage_path TEXT;
   ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS banner_original_name VARCHAR(255);
   ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS rsvp_fields JSONB NOT NULL DEFAULT '{"emailAddress":true}'::jsonb;
+  ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS rsvp_field_config JSONB DEFAULT '{}'::jsonb;
   ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS is_rsvp_active BOOLEAN DEFAULT TRUE;
   ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS custom_answers JSONB DEFAULT '{}'::jsonb;
+  ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS link_url TEXT;
+  ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS textarea_response TEXT;
   ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS address TEXT;
   ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS first_timer BOOLEAN DEFAULT FALSE;
   ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS department VARCHAR(100);

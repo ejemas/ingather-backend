@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS programs (
     end_time TIME NOT NULL,
     tracking_mode VARCHAR(50) NOT NULL, -- 'count-only' or 'collect-data'
     data_fields JSONB, -- Store selected fields as JSON
+    data_field_config JSONB DEFAULT '{}'::jsonb,
     gifting_enabled BOOLEAN DEFAULT FALSE,
     total_winners INTEGER DEFAULT 0,
     winners_selected INTEGER DEFAULT 0,
@@ -96,6 +97,8 @@ CREATE TABLE IF NOT EXISTS attendees (
     full_name VARCHAR(255),
     email_address VARCHAR(255),
     school VARCHAR(255),
+    link_url TEXT,
+    textarea_response TEXT,
     phone_number VARCHAR(50),
     address TEXT,
     first_timer BOOLEAN DEFAULT FALSE,
@@ -141,6 +144,7 @@ CREATE TABLE IF NOT EXISTS pre_events (
     banner_storage_path TEXT,
     banner_original_name VARCHAR(255),
     rsvp_fields JSONB NOT NULL DEFAULT '{"emailAddress":true}'::jsonb,
+    rsvp_field_config JSONB DEFAULT '{}'::jsonb,
     slug VARCHAR(160) UNIQUE NOT NULL,
     is_rsvp_active BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -155,6 +159,8 @@ CREATE TABLE IF NOT EXISTS pre_event_rsvps (
     full_name VARCHAR(255),
     phone_number VARCHAR(50),
     school VARCHAR(255),
+    link_url TEXT,
+    textarea_response TEXT,
     organization VARCHAR(255),
     ticket_type VARCHAR(120),
     address TEXT,

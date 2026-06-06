@@ -9,6 +9,8 @@ const RSVP_FIELD_LABELS = {
   fullName: 'Full Name',
   phoneNumber: 'Phone Number',
   school: 'School',
+  link: 'Link',
+  textarea: 'Additional Response',
   organization: 'Organization',
   ticketType: 'Ticket Type',
   address: 'Address',
@@ -23,6 +25,8 @@ const OPTIONAL_RSVP_FIELDS = [
   'fullName',
   'phoneNumber',
   'school',
+  'link',
+  'textarea',
   'organization',
   'ticketType',
   'address',
@@ -50,6 +54,27 @@ const isValidEmail = (value) => {
     && email.length <= 255
     && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
     && email.indexOf('@') === email.lastIndexOf('@');
+};
+
+const DEFAULT_TEXTAREA_LABEL = 'Additional Response';
+
+const normalizeFieldConfig = (config = {}) => ({
+  textareaLabel: typeof config.textareaLabel === 'string' && config.textareaLabel.trim()
+    ? config.textareaLabel.trim().slice(0, 120)
+    : DEFAULT_TEXTAREA_LABEL
+});
+
+const normalizeUrlField = (value) => {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!raw) return '';
+
+  try {
+    const url = new URL(raw);
+    if (!['http:', 'https:'].includes(url.protocol)) return '';
+    return url.toString();
+  } catch (error) {
+    return '';
+  }
 };
 
 const normalizeRsvpFields = (fields = {}) => {
@@ -100,6 +125,7 @@ const mapPreEvent = (row, extras = {}) => ({
   bannerUrl: row.banner_url || null,
   bannerOriginalName: row.banner_original_name || null,
   rsvpFields: normalizeRsvpFields(row.rsvp_fields || {}),
+  rsvpFieldConfig: normalizeFieldConfig(row.rsvp_field_config || {}),
   slug: row.slug,
   publicUrl: getPublicRsvpUrl(row.slug),
   isRsvpActive: row.is_rsvp_active !== false,
@@ -115,6 +141,8 @@ const mapRsvp = (row) => ({
   fullName: row.full_name || '',
   phoneNumber: row.phone_number || '',
   school: row.school || '',
+  linkUrl: row.link_url || '',
+  textareaResponse: row.textarea_response || '',
   organization: row.organization || '',
   ticketType: row.ticket_type || '',
   address: row.address || '',
@@ -167,6 +195,8 @@ const validateRsvpPayload = (fields, formData = {}) => {
     fullName: null,
     phoneNumber: null,
     school: null,
+    linkUrl: null,
+    textareaResponse: null,
     organization: null,
     ticketType: null,
     address: null,
@@ -178,6 +208,24 @@ const validateRsvpPayload = (fields, formData = {}) => {
   };
 
   OPTIONAL_RSVP_FIELDS.forEach((field) => {
+    if (field === 'link') {
+      const linkUrl = normalizeUrlField(formData.linkUrl || formData.link);
+      if (normalizedFields.link && !linkUrl) {
+        throw new Error('Link must be a valid http or https URL.');
+      }
+      payload.linkUrl = linkUrl || null;
+      return;
+    }
+
+    if (field === 'textarea') {
+      const response = cleanText(formData.textareaResponse, 5000);
+      if (normalizedFields.textarea && !response) {
+        throw new Error('Additional response is required.');
+      }
+      payload.textareaResponse = response || null;
+      return;
+    }
+
     if (field === 'firstTimer') {
       payload.firstTimer = Boolean(formData.firstTimer);
       return;
@@ -241,6 +289,7 @@ exports.createPreEvent = async (req, res) => {
     const eventDate = parseEventDate(req.body.eventDate);
     const description = cleanText(req.body.description, 5000);
     const rsvpFields = normalizeRsvpFields(req.body.rsvpFields);
+    const rsvpFieldConfig = normalizeFieldConfig(req.body.rsvpFieldConfig || {});
     const isRsvpActive = req.body.isRsvpActive !== false;
     const linkedProgramId = await validateLinkedProgram(req.churchId, req.body.programId);
 
@@ -265,9 +314,9 @@ exports.createPreEvent = async (req, res) => {
     const result = await pool.query(
       `INSERT INTO pre_events (
         church_id, program_id, title, event_date, description, banner_url, banner_storage_path,
-        banner_original_name, rsvp_fields, slug, is_rsvp_active
+        banner_original_name, rsvp_fields, rsvp_field_config, slug, is_rsvp_active
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11, $12)
       RETURNING *`,
       [
         req.churchId,
@@ -279,6 +328,7 @@ exports.createPreEvent = async (req, res) => {
         uploadedBanner?.flyerStoragePath || null,
         cleanText(req.body.banner?.originalName, 255) || null,
         JSON.stringify(rsvpFields),
+        JSON.stringify(rsvpFieldConfig),
         slug,
         isRsvpActive
       ]
@@ -376,6 +426,7 @@ exports.updatePreEvent = async (req, res) => {
     const eventDate = parseEventDate(req.body.eventDate ?? existing.event_date);
     const description = cleanText(req.body.description ?? existing.description, 5000);
     const rsvpFields = normalizeRsvpFields(req.body.rsvpFields || existing.rsvp_fields);
+    const rsvpFieldConfig = normalizeFieldConfig(req.body.rsvpFieldConfig || existing.rsvp_field_config || {});
     const linkedProgramId = Object.prototype.hasOwnProperty.call(req.body, 'programId')
       ? await validateLinkedProgram(req.churchId, req.body.programId)
       : existing.program_id || null;
@@ -409,9 +460,10 @@ exports.updatePreEvent = async (req, res) => {
            banner_storage_path = COALESCE($6, banner_storage_path),
            banner_original_name = COALESCE($7, banner_original_name),
            rsvp_fields = $8::jsonb,
-           is_rsvp_active = $9,
+           rsvp_field_config = $9::jsonb,
+           is_rsvp_active = $10,
            updated_at = CURRENT_TIMESTAMP
-       WHERE id = $10 AND church_id = $11
+       WHERE id = $11 AND church_id = $12
        RETURNING *`,
       [
         title,
@@ -422,6 +474,7 @@ exports.updatePreEvent = async (req, res) => {
         uploadedBanner?.flyerStoragePath || null,
         req.body.banner?.dataUrl ? cleanText(req.body.banner?.originalName, 255) || null : null,
         JSON.stringify(rsvpFields),
+        JSON.stringify(rsvpFieldConfig),
         isRsvpActive,
         existing.id,
         req.churchId
@@ -511,10 +564,10 @@ exports.submitPublicRsvp = async (req, res) => {
     const result = await pool.query(
       `INSERT INTO pre_event_rsvps (
         pre_event_id, email_address, full_name, phone_number, school,
-        organization, ticket_type, address, first_timer, department, fellowship,
-        age, sex, status, registration_type
+        link_url, textarea_response, organization, ticket_type, address, first_timer,
+        department, fellowship, age, sex, status, registration_type
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'pre_registered', 'rsvp')
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pre_registered', 'rsvp')
       RETURNING *`,
       [
         preEvent.id,
@@ -522,6 +575,8 @@ exports.submitPublicRsvp = async (req, res) => {
         payload.fullName,
         payload.phoneNumber,
         payload.school,
+        payload.linkUrl,
+        payload.textareaResponse,
         payload.organization,
         payload.ticketType,
         payload.address,
@@ -543,7 +598,7 @@ exports.submitPublicRsvp = async (req, res) => {
       return res.status(409).json({ error: 'This email has already secured access for this event.' });
     }
 
-    const isValidationError = /required|valid email|age must|valid gender/i.test(error.message || '');
+    const isValidationError = /required|valid email|valid http|age must|valid gender/i.test(error.message || '');
     if (isValidationError) {
       return res.status(400).json({ error: error.message });
     }

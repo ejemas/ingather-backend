@@ -34,6 +34,27 @@ const isValidCollectedEmail = (value) => {
     && email.indexOf('@') === email.lastIndexOf('@');
 };
 
+const DEFAULT_TEXTAREA_LABEL = 'Additional Response';
+
+const normalizeFieldConfig = (config = {}) => ({
+  textareaLabel: typeof config.textareaLabel === 'string' && config.textareaLabel.trim()
+    ? config.textareaLabel.trim().slice(0, 120)
+    : DEFAULT_TEXTAREA_LABEL
+});
+
+const normalizeUrlField = (value) => {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!raw) return '';
+
+  try {
+    const url = new URL(raw);
+    if (!['http:', 'https:'].includes(url.protocol)) return '';
+    return url.toString();
+  } catch (error) {
+    return '';
+  }
+};
+
 const normalizePersonalizedFlyerConfig = (config = {}) => {
   const templatesFromArray = Array.isArray(config.templates)
     ? config.templates.map(message => String(message || '').trim()).filter(Boolean)
@@ -218,6 +239,7 @@ const mapProgramDetail = (program, counts = {}) => ({
   endTime: program.end_time,
   trackingMode: program.tracking_mode,
   dataFields: program.data_fields,
+  dataFieldConfig: normalizeFieldConfig(program.data_field_config || {}),
   giftingEnabled: program.gifting_enabled,
   totalWinners: program.total_winners,
   winnersSelected: program.winners_selected,
@@ -244,6 +266,8 @@ const mapAttendee = (attendee) => ({
   fullName: attendee.full_name,
   emailAddress: attendee.email_address,
   school: attendee.school,
+  linkUrl: attendee.link_url || '',
+  textareaResponse: attendee.textarea_response || '',
   phoneNumber: attendee.phone_number,
   address: attendee.address,
   firstTimer: attendee.first_timer,
@@ -526,6 +550,7 @@ exports.createProgram = async (req, res) => {
       endTime,
       trackingMode,
       dataFields,
+      dataFieldConfig,
       enableGifting,
       numberOfWinners,
       eventFlyer,
@@ -548,6 +573,7 @@ exports.createProgram = async (req, res) => {
       ? Number(sponsorExpectedAttendees)
       : null;
     const resolvedDataFields = { ...(dataFields || {}) };
+    const resolvedDataFieldConfig = normalizeFieldConfig(dataFieldConfig || {});
     const resolvedTrackingMode = flyerType === 'personalized' ? 'collect-data' : trackingMode;
     const normalizedProxyCheckinEnabled = resolvedTrackingMode === 'collect-data' && proxyCheckinEnabled === true;
     const normalizedStrictDeviceFingerprinting = resolvedTrackingMode !== 'collect-data' || strictDeviceFingerprinting !== false;
@@ -625,8 +651,8 @@ exports.createProgram = async (req, res) => {
 
       result = await client.query(
         `INSERT INTO programs
-         (church_id, title, date, start_time, end_time, tracking_mode, data_fields, gifting_enabled, total_winners, flyer_type, flyer_url, flyer_storage_path, flyer_original_name, personalized_flyer_config, personalized_background_url, personalized_background_storage_path, personalized_background_original_name, personalized_logo_url, personalized_logo_storage_path, personalized_logo_original_name, sponsor_display_mode, sponsor_expected_attendees, proxy_checkin_enabled, strict_device_fingerprinting)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+         (church_id, title, date, start_time, end_time, tracking_mode, data_fields, data_field_config, gifting_enabled, total_winners, flyer_type, flyer_url, flyer_storage_path, flyer_original_name, personalized_flyer_config, personalized_background_url, personalized_background_storage_path, personalized_background_original_name, personalized_logo_url, personalized_logo_storage_path, personalized_logo_original_name, sponsor_display_mode, sponsor_expected_attendees, proxy_checkin_enabled, strict_device_fingerprinting)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
          RETURNING *`,
         [
           churchId,
@@ -636,6 +662,7 @@ exports.createProgram = async (req, res) => {
           endTime,
           resolvedTrackingMode,
           JSON.stringify(resolvedDataFields),
+          JSON.stringify(resolvedDataFieldConfig),
           enableGifting || false,
           numberOfWinners || 0,
           flyerType,
@@ -1129,6 +1156,8 @@ exports.addManualAttendee = async (req, res) => {
       else if (!isValidCollectedEmail(formData.emailAddress)) errors.emailAddress = 'Enter a valid email address';
     }
     if (dataFields.school && !cleanText(formData.school)) errors.school = 'School is required';
+    if (dataFields.link && !normalizeUrlField(formData.linkUrl || formData.link)) errors.linkUrl = 'Enter a valid link starting with http:// or https://';
+    if (dataFields.textarea && !cleanText(formData.textareaResponse)) errors.textareaResponse = 'Response is required';
     if (dataFields.phoneNumber && !cleanText(formData.phoneNumber)) errors.phoneNumber = 'Phone number is required';
     if (dataFields.address && !cleanText(formData.address)) errors.address = 'Address is required';
     if (dataFields.department && !cleanText(formData.department)) errors.department = 'Department is required';
@@ -1165,6 +1194,8 @@ exports.addManualAttendee = async (req, res) => {
     const sex = cleanText(formData.sex) || null;
     const emailAddress = dataFields.emailAddress ? normalizeCollectedEmail(formData.emailAddress) : null;
     const school = dataFields.school ? cleanText(formData.school) : null;
+    const linkUrl = dataFields.link ? normalizeUrlField(formData.linkUrl || formData.link) : null;
+    const textareaResponse = dataFields.textarea ? cleanText(formData.textareaResponse).slice(0, 5000) : null;
 
     const scanResult = await client.query(
       `INSERT INTO scans
@@ -1181,14 +1212,16 @@ exports.addManualAttendee = async (req, res) => {
 
     const attendeeResult = await client.query(
       `INSERT INTO attendees
-       (program_id, full_name, email_address, school, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id, status, registration_type, checked_in_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'checked_in', 'manual', CURRENT_TIMESTAMP)
+       (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id, status, registration_type, checked_in_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'checked_in', 'manual', CURRENT_TIMESTAMP)
        RETURNING *`,
       [
         id,
         cleanText(formData.fullName) || null,
         emailAddress,
         school,
+        linkUrl,
+        textareaResponse,
         cleanText(formData.phoneNumber) || null,
         cleanText(formData.address) || null,
         firstTimer,

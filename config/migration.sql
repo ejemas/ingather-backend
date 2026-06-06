@@ -198,8 +198,11 @@ ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS program_id INTEGER REFERENCES pr
 ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS banner_storage_path TEXT;
 ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS banner_original_name VARCHAR(255);
 ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS rsvp_fields JSONB NOT NULL DEFAULT '{"emailAddress":true}'::jsonb;
+ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS rsvp_field_config JSONB DEFAULT '{}'::jsonb;
 ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS is_rsvp_active BOOLEAN DEFAULT TRUE;
 ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS custom_answers JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS link_url TEXT;
+ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS textarea_response TEXT;
 ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS address TEXT;
 ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS first_timer BOOLEAN DEFAULT FALSE;
 ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS department VARCHAR(100);
@@ -246,3 +249,11 @@ CREATE INDEX IF NOT EXISTS idx_pre_events_program_id ON pre_events(program_id);
 CREATE INDEX IF NOT EXISTS idx_pre_events_slug ON pre_events(slug);
 CREATE INDEX IF NOT EXISTS idx_pre_event_rsvps_event_time ON pre_event_rsvps(pre_event_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_attendees_program_checked_in ON attendees(program_id, checked_in_at DESC);
+
+-- Migration: Link and editable textarea data fields
+ALTER TABLE programs ADD COLUMN IF NOT EXISTS data_field_config JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE attendees ADD COLUMN IF NOT EXISTS link_url TEXT;
+ALTER TABLE attendees ADD COLUMN IF NOT EXISTS textarea_response TEXT;
+ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS rsvp_field_config JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS link_url TEXT;
+ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS textarea_response TEXT;
