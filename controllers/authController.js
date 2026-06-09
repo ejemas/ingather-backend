@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const pool = require('../config/database');
 const { generateOTP, sendOTPEmail, sendPasswordResetEmail } = require('../utils/emailService');
+const { hashInviteToken } = require('../utils/waitlistInviteService');
 
 const OTP_MAX_ATTEMPTS = 5;
 const VALID_ORGANIZATION_TYPES = new Set([
@@ -80,18 +81,58 @@ const incrementOtpAttempts = (email) => {
 
 // Register Church
 exports.register = async (req, res) => {
+  let client;
+  let transactionOpen = false;
+
   try {
-    const { churchName, branchName, email, password, location, logoUrl, organizationType } = req.body;
+    const { churchName, branchName, email, password, location, logoUrl, organizationType, inviteToken } = req.body;
     const normalizedEmail = normalizeEmail(email);
     const selectedOrganizationType = isValidOrganizationType(organizationType) ? organizationType : null;
+    const inviteTokenHash = inviteToken ? hashInviteToken(inviteToken) : null;
+
+    client = await pool.connect();
+    await client.query('BEGIN');
+    transactionOpen = true;
+
+    let inviteLead = null;
+
+    if (inviteTokenHash) {
+      const inviteResult = await client.query(
+        `SELECT *
+         FROM waitlist_leads
+         WHERE invite_token_hash = $1
+           AND status = 'invited'
+           AND accepted_at IS NULL
+           AND rejected_at IS NULL
+           AND invite_expires_at > NOW()
+         FOR UPDATE`,
+        [inviteTokenHash]
+      );
+
+      if (inviteResult.rows.length === 0) {
+        await client.query('ROLLBACK');
+        transactionOpen = false;
+        return res.status(403).json({ error: 'This invite link is invalid or has expired.' });
+      }
+
+      inviteLead = inviteResult.rows[0];
+
+      if (normalizeEmail(inviteLead.email) !== normalizedEmail) {
+        await client.query('ROLLBACK');
+        transactionOpen = false;
+        return res.status(403).json({ error: 'This invite link is tied to a different email address.' });
+      }
+    }
 
     // Check if church already exists
-    const churchExists = await pool.query(
+    const churchExists = await client.query(
       'SELECT * FROM churches WHERE email = $1',
       [normalizedEmail]
     );
 
     if (churchExists.rows.length > 0) {
+      await client.query('ROLLBACK');
+      transactionOpen = false;
       return res.status(400).json({ error: 'Account with this email already exists' });
     }
 
@@ -105,12 +146,27 @@ exports.register = async (req, res) => {
     const otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
     // Insert church with OTP
-    const result = await pool.query(
+    const result = await client.query(
       `INSERT INTO churches (church_name, branch_name, email, password, location, logo_url, organization_type, is_verified, otp_code, otp_expires_at, otp_attempts, otp_purpose) 
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11) 
        RETURNING id, church_name, branch_name, email, location, organization_type`,
       [churchName, branchName, normalizedEmail, hashedPassword, location, logoUrl || null, selectedOrganizationType, false, hashedOtp, otpExpiresAt, 'verify']
     );
+
+    if (inviteLead) {
+      await client.query(
+        `UPDATE waitlist_leads
+         SET status = 'accepted',
+             accepted_at = NOW(),
+             accepted_church_id = $2,
+             invite_token_hash = NULL
+         WHERE id = $1`,
+        [inviteLead.id, result.rows[0].id]
+      );
+    }
+
+    await client.query('COMMIT');
+    transactionOpen = false;
 
     // Send OTP email
     await sendOTPEmail(normalizedEmail, otp);
@@ -123,8 +179,19 @@ exports.register = async (req, res) => {
       organizationType: result.rows[0].organization_type || null
     });
   } catch (error) {
+    if (client && transactionOpen) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        console.error('Register rollback error:', rollbackError);
+      }
+    }
     console.error('Register error:', error);
     res.status(500).json({ error: 'Server error during registration' });
+  } finally {
+    if (client) {
+      client.release();
+    }
   }
 };
 

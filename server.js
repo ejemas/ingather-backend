@@ -70,6 +70,7 @@ const programRoutes = require('./routes/programRoutes');
 const scanRoutes = require('./routes/scanRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
 const preEventRoutes = require('./routes/preEventRoutes');
+const waitlistRoutes = require('./routes/waitlistRoutes');
 
 // API Routes
 app.get('/', (req, res) => {
@@ -81,6 +82,7 @@ app.use('/api/programs', programRoutes);
 app.use('/api/scan', scanRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/pre-events', preEventRoutes);
+app.use('/api/waitlist', waitlistRoutes);
 
 // Socket.io connection
 io.on('connection', (socket) => {
@@ -364,6 +366,67 @@ pool.query(`
 `)
   .then(() => console.log('✅ Migration check: notifications tables ready'))
   .catch(err => console.error('Migration warning (notifications):', err.message));
+
+// Auto-migrate: invite-only waitlist table
+pool.query(`
+  CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+  CREATE TABLE IF NOT EXISTS waitlist_leads (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    first_name TEXT NOT NULL,
+    last_name TEXT NOT NULL,
+    email TEXT NOT NULL,
+    organization_name TEXT,
+    event_size TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    invite_token_hash TEXT,
+    invite_expires_at TIMESTAMPTZ,
+    invited_at TIMESTAMPTZ,
+    accepted_at TIMESTAMPTZ,
+    rejected_at TIMESTAMPTZ,
+    accepted_church_id INTEGER REFERENCES churches(id) ON DELETE SET NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    CONSTRAINT waitlist_leads_event_size_check
+      CHECK (event_size IN ('1-50', '50-200', '200-500', '500+')),
+    CONSTRAINT waitlist_leads_status_check
+      CHECK (status IN ('pending', 'invited', 'accepted', 'rejected'))
+  );
+  ALTER TABLE waitlist_leads ADD COLUMN IF NOT EXISTS invite_token_hash TEXT;
+  ALTER TABLE waitlist_leads ADD COLUMN IF NOT EXISTS invite_expires_at TIMESTAMPTZ;
+  ALTER TABLE waitlist_leads ADD COLUMN IF NOT EXISTS invited_at TIMESTAMPTZ;
+  ALTER TABLE waitlist_leads ADD COLUMN IF NOT EXISTS accepted_at TIMESTAMPTZ;
+  ALTER TABLE waitlist_leads ADD COLUMN IF NOT EXISTS rejected_at TIMESTAMPTZ;
+  ALTER TABLE waitlist_leads ADD COLUMN IF NOT EXISTS accepted_church_id INTEGER REFERENCES churches(id) ON DELETE SET NULL;
+  ALTER TABLE waitlist_leads DROP CONSTRAINT IF EXISTS waitlist_leads_status_check;
+  UPDATE waitlist_leads SET status = 'accepted' WHERE status = 'approved';
+  ALTER TABLE waitlist_leads
+    ADD CONSTRAINT waitlist_leads_status_check
+    CHECK (status IN ('pending', 'invited', 'accepted', 'rejected'));
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_waitlist_leads_email_lower
+    ON waitlist_leads (LOWER(email));
+  CREATE INDEX IF NOT EXISTS idx_waitlist_leads_created_at
+    ON waitlist_leads (created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_waitlist_leads_status_created
+    ON waitlist_leads (status, created_at DESC);
+  CREATE INDEX IF NOT EXISTS idx_waitlist_leads_invite_hash
+    ON waitlist_leads (invite_token_hash)
+    WHERE invite_token_hash IS NOT NULL;
+  ALTER TABLE waitlist_leads ENABLE ROW LEVEL SECURITY;
+  DO $$
+  BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+      GRANT INSERT ON waitlist_leads TO anon;
+      DROP POLICY IF EXISTS waitlist_leads_public_insert ON waitlist_leads;
+      CREATE POLICY waitlist_leads_public_insert
+        ON waitlist_leads
+        FOR INSERT
+        TO anon
+        WITH CHECK (true);
+    END IF;
+  END;
+  $$;
+`)
+  .then(() => console.log('Migration check: waitlist table ready'))
+  .catch(err => console.error('Migration warning (waitlist):', err.message));
 
 server.listen(PORT, () => {
   console.log(`

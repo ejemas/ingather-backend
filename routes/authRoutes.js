@@ -23,16 +23,35 @@ const organizationTypes = [
   'communityGathering'
 ];
 
+const isInviteOnlyMode = () => process.env.INVITE_ONLY_MODE !== 'false';
+
+const blockRegistrationWhenInviteOnly = (req, res, next) => {
+  if (!isInviteOnlyMode()) {
+    return next();
+  }
+
+  if (req.body?.inviteToken) {
+    return next();
+  }
+
+  return res.status(403).json({
+    error: 'Ingather is currently invite-only. Join the waitlist to request access.',
+    inviteOnly: true
+  });
+};
+
 // Register
 router.post(
   '/register',
   registerLimiter,
+  blockRegistrationWhenInviteOnly,
   [
     body('churchName').notEmpty().withMessage('Church name is required'),
     body('branchName').notEmpty().withMessage('Branch name is required'),
     body('email').isEmail().withMessage('Valid email is required'),
     body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
     body('location').notEmpty().withMessage('Location is required'),
+    body('inviteToken').optional({ nullable: true }).isLength({ min: 20, max: 200 }).withMessage('Valid invite token is required'),
     body('organizationType')
       .optional({ nullable: true })
       .isIn(organizationTypes)
