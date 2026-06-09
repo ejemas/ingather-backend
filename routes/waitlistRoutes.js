@@ -29,6 +29,7 @@ router.post(
     body('email').trim().isEmail().withMessage('Valid email is required').isLength({ max: 255 }),
     body('organizationName').optional({ nullable: true }).trim().isLength({ max: 180 }),
     body('eventSize').isIn(['1-50', '50-200', '200-500', '500+']).withMessage('Valid event size is required'),
+    body('upcomingEventAt').isISO8601().withMessage('Valid upcoming event date and time is required'),
     body('website').optional({ nullable: true }).trim().isLength({ max: 200 }),
     validate
   ],

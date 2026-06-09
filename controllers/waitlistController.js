@@ -38,6 +38,7 @@ const mapLead = (row) => ({
   email: row.email,
   organizationName: row.organization_name,
   eventSize: row.event_size,
+  upcomingEventAt: row.upcoming_event_at,
   status: row.status,
   createdAt: row.created_at,
   invitedAt: row.invited_at,
@@ -55,6 +56,7 @@ exports.joinWaitlist = async (req, res) => {
       email,
       organizationName,
       eventSize,
+      upcomingEventAt,
       website
     } = req.body || {};
 
@@ -67,6 +69,7 @@ exports.joinWaitlist = async (req, res) => {
     const normalizedEmail = normalizeEmail(email);
     const normalizedOrganizationName = normalizeText(organizationName);
     const normalizedEventSize = normalizeText(eventSize);
+    const parsedUpcomingEventAt = new Date(upcomingEventAt);
 
     if (!normalizedFirstName || normalizedFirstName.length > 80) {
       return res.status(400).json({ error: 'First name is required.' });
@@ -88,6 +91,10 @@ exports.joinWaitlist = async (req, res) => {
       return res.status(400).json({ error: 'Choose a valid event size.' });
     }
 
+    if (!upcomingEventAt || Number.isNaN(parsedUpcomingEventAt.getTime())) {
+      return res.status(400).json({ error: 'Upcoming event date and time is required.' });
+    }
+
     const result = await pool.query(
       `INSERT INTO waitlist_leads (
         first_name,
@@ -95,16 +102,18 @@ exports.joinWaitlist = async (req, res) => {
         email,
         organization_name,
         event_size,
+        upcoming_event_at,
         status
       )
-      VALUES ($1, $2, $3, $4, $5, $6)
-      RETURNING id, email, status, created_at`,
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      RETURNING id, email, status, created_at, upcoming_event_at`,
       [
         normalizedFirstName,
         normalizedLastName,
         normalizedEmail,
         normalizedOrganizationName || null,
         normalizedEventSize,
+        parsedUpcomingEventAt.toISOString(),
         STATUS_PENDING
       ]
     );
@@ -115,6 +124,7 @@ exports.joinWaitlist = async (req, res) => {
         id: result.rows[0].id,
         email: result.rows[0].email,
         status: result.rows[0].status,
+        upcomingEventAt: result.rows[0].upcoming_event_at,
         createdAt: result.rows[0].created_at
       }
     });

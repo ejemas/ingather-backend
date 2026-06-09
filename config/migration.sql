@@ -268,6 +268,7 @@ CREATE TABLE IF NOT EXISTS waitlist_leads (
     email TEXT NOT NULL,
     organization_name TEXT,
     event_size TEXT NOT NULL,
+    upcoming_event_at TIMESTAMPTZ,
     status TEXT NOT NULL DEFAULT 'pending',
     invite_token_hash TEXT,
     invite_expires_at TIMESTAMPTZ,
@@ -282,6 +283,7 @@ CREATE TABLE IF NOT EXISTS waitlist_leads (
       CHECK (status IN ('pending', 'invited', 'accepted', 'rejected'))
 );
 
+ALTER TABLE waitlist_leads ADD COLUMN IF NOT EXISTS upcoming_event_at TIMESTAMPTZ;
 ALTER TABLE waitlist_leads ADD COLUMN IF NOT EXISTS invite_token_hash TEXT;
 ALTER TABLE waitlist_leads ADD COLUMN IF NOT EXISTS invite_expires_at TIMESTAMPTZ;
 ALTER TABLE waitlist_leads ADD COLUMN IF NOT EXISTS invited_at TIMESTAMPTZ;
