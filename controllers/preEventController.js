@@ -252,7 +252,7 @@ const validateRsvpPayload = (fields, formData = {}) => {
       throw new Error(`${RSVP_FIELD_LABELS[field]} is required.`);
     }
 
-    if (field === 'sex' && value && !['Male', 'Female', 'Other'].includes(value)) {
+    if (field === 'sex' && value && !['Male', 'Female'].includes(value)) {
       throw new Error('Please select a valid gender.');
     }
 
