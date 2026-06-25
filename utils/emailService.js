@@ -127,4 +127,62 @@ const sendWaitlistInviteEmail = async ({ email, firstName, inviteLink }) => {
   return { sent: true };
 };
 
-module.exports = { generateOTP, sendOTPEmail, sendPasswordResetEmail, sendWaitlistInviteEmail };
+const sendRsvpQrEmail = async ({ email, attendeeName, eventTitle, eventDate, organizerName, qrDataUrl, checkinLink }) => {
+  if (!resend) {
+    return { sent: false, reason: 'RESEND_API_KEY is not configured' };
+  }
+
+  const safeName = attendeeName || 'there';
+  const safeOrganizer = organizerName || 'your event organizer';
+  const eventDateLabel = eventDate
+    ? new Date(eventDate).toLocaleString('en-US', {
+        weekday: 'short',
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit'
+      })
+    : 'Event date';
+
+  const { error } = await resend.emails.send({
+    from: `Ingather <${process.env.EMAIL_FROM || 'no-reply@ingather.app'}>`,
+    to: email,
+    subject: `Your check-in QR for ${eventTitle}`,
+    html: `
+      <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 600px; margin: 0 auto; background-color: #090809; border-radius: 20px; overflow: hidden;">
+        <div style="background: linear-gradient(135deg, #F96D10 0%, #e05d00 100%); padding: 32px;">
+          <h1 style="color: #ffffff; margin: 0; font-size: 28px;">Ingather</h1>
+        </div>
+        <div style="padding: 32px; color: #ffffff;">
+          <p style="color: #F96D10; font-weight: 800; text-transform: uppercase; font-size: 12px; letter-spacing: .08em; margin: 0 0 12px;">Pre-event access confirmed</p>
+          <h2 style="margin: 0 0 12px; font-size: 25px;">Hi ${safeName}, your check-in QR is ready.</h2>
+          <p style="color: rgba(255,255,255,.74); line-height: 1.65; margin: 0 0 22px;">
+            Bring this QR code to <strong style="color:#fff;">${eventTitle}</strong>. ${safeOrganizer} will scan it at the entrance to check you in quickly.
+          </p>
+          <div style="background:#ffffff; border-radius: 18px; padding: 20px; text-align:center; margin: 24px auto; max-width: 280px;">
+            <img src="${qrDataUrl}" alt="Personal check-in QR code" width="220" height="220" style="display:block; margin:0 auto;" />
+          </div>
+          <div style="background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.12); border-radius: 14px; padding: 16px; margin-bottom: 22px;">
+            <p style="margin:0; color:rgba(255,255,255,.62); font-size:13px;">Event</p>
+            <strong style="display:block; margin-top:4px;">${eventTitle}</strong>
+            <p style="margin:10px 0 0; color:rgba(255,255,255,.82);">${eventDateLabel}</p>
+          </div>
+          <p style="color: rgba(255,255,255,.56); font-size: 13px; line-height: 1.55; margin: 0;">
+            If the QR image does not display, show this secure fallback link at check-in:<br />
+            <a href="${checkinLink}" style="color:#F96D10; word-break:break-all;">${checkinLink}</a>
+          </p>
+        </div>
+      </div>
+    `
+  });
+
+  if (error) {
+    console.error('RSVP QR email error:', error);
+    return { sent: false, reason: error.message || 'Failed to send RSVP QR email' };
+  }
+
+  return { sent: true };
+};
+
+module.exports = { generateOTP, sendOTPEmail, sendPasswordResetEmail, sendWaitlistInviteEmail, sendRsvpQrEmail };

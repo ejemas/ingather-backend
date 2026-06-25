@@ -173,6 +173,9 @@ CREATE TABLE IF NOT EXISTS pre_event_rsvps (
     status VARCHAR(30) NOT NULL DEFAULT 'pre_registered',
     registration_type VARCHAR(30) NOT NULL DEFAULT 'rsvp',
     checked_in_at TIMESTAMP,
+    checkin_token_hash TEXT,
+    checkin_qr_sent_at TIMESTAMPTZ,
+    checkin_qr_last_sent_at TIMESTAMPTZ,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT pre_event_rsvps_status_check CHECK (status IN ('pre_registered', 'checked_in')),
@@ -181,6 +184,13 @@ CREATE TABLE IF NOT EXISTS pre_event_rsvps (
 
 ALTER TABLE pre_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pre_event_rsvps ENABLE ROW LEVEL SECURITY;
+
+ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checkin_token_hash TEXT;
+ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checkin_qr_sent_at TIMESTAMPTZ;
+ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checkin_qr_last_sent_at TIMESTAMPTZ;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pre_event_rsvps_checkin_token_hash
+  ON pre_event_rsvps(checkin_token_hash)
+  WHERE checkin_token_hash IS NOT NULL;
 
 -- Invite-only waitlist leads. Public inserts are handled by the Express API;
 -- RLS remains enabled as defense in depth for Supabase-exposed schemas.

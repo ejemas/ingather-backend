@@ -1,6 +1,8 @@
 const crypto = require('crypto');
+const QRCode = require('qrcode');
 const pool = require('../config/database');
 const { uploadEventFlyer, deleteEventFlyer } = require('../utils/supabaseStorage');
+const { sendRsvpQrEmail } = require('../utils/emailService');
 
 const PUBLIC_FRONTEND_ORIGIN = 'https://ingather.app';
 
@@ -40,6 +42,14 @@ const OPTIONAL_RSVP_FIELDS = [
 const trimTrailingSlash = (value) => String(value || '').replace(/\/+$/, '');
 
 const getPublicRsvpUrl = (slug) => `${trimTrailingSlash(PUBLIC_FRONTEND_ORIGIN)}/rsvp/${slug}`;
+
+const getRsvpCheckinUrl = (token) => `${trimTrailingSlash(PUBLIC_FRONTEND_ORIGIN)}/rsvp-checkin/${token}`;
+
+const generateRsvpCheckinToken = () => crypto.randomBytes(32).toString('base64url');
+
+const hashRsvpCheckinToken = (token) => (
+  crypto.createHash('sha256').update(String(token || '')).digest('hex')
+);
 
 const cleanText = (value, maxLength = 255) => {
   if (typeof value !== 'string') return '';
@@ -155,8 +165,46 @@ const mapRsvp = (row) => ({
   status: row.status || 'pre_registered',
   registrationType: row.registration_type || 'rsvp',
   checkedInAt: row.checked_in_at || null,
+  checkinQrSentAt: row.checkin_qr_sent_at || null,
+  checkinQrLastSentAt: row.checkin_qr_last_sent_at || null,
+  hasCheckinQr: Boolean(row.checkin_token_hash),
   createdAt: row.created_at
 });
+
+const sendCheckinQrForRsvp = async ({ preEvent, rsvp, token }) => {
+  const checkinToken = token || generateRsvpCheckinToken();
+  const checkinTokenHash = hashRsvpCheckinToken(checkinToken);
+  const checkinLink = getRsvpCheckinUrl(checkinToken);
+  const qrDataUrl = await QRCode.toDataURL(checkinLink, {
+    errorCorrectionLevel: 'M',
+    margin: 2,
+    width: 320
+  });
+
+  const emailResult = await sendRsvpQrEmail({
+    email: rsvp.email_address,
+    attendeeName: rsvp.full_name,
+    eventTitle: preEvent.title,
+    eventDate: preEvent.event_date,
+    organizerName: preEvent.church_name,
+    qrDataUrl,
+    checkinLink
+  });
+
+  if (emailResult.sent) {
+    await pool.query(
+      `UPDATE pre_event_rsvps
+       SET checkin_token_hash = $1,
+           checkin_qr_last_sent_at = CURRENT_TIMESTAMP,
+           checkin_qr_sent_at = COALESCE(checkin_qr_sent_at, CURRENT_TIMESTAMP),
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2`,
+      [checkinTokenHash, rsvp.id]
+    );
+  }
+
+  return { ...emailResult, tokenHash: checkinTokenHash };
+};
 
 const getOwnedPreEventRow = async (churchId, id) => {
   const result = await pool.query(
@@ -526,7 +574,7 @@ exports.deletePreEvent = async (req, res) => {
 exports.getPublicPreEvent = async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, title, event_date, description, banner_url, rsvp_fields, slug, is_rsvp_active
+      `SELECT id, title, event_date, description, banner_url, rsvp_fields, rsvp_field_config, slug, is_rsvp_active
        FROM pre_events
        WHERE slug = $1`,
       [req.params.slug]
@@ -546,7 +594,10 @@ exports.getPublicPreEvent = async (req, res) => {
 exports.submitPublicRsvp = async (req, res) => {
   try {
     const eventResult = await pool.query(
-      'SELECT * FROM pre_events WHERE slug = $1',
+      `SELECT pe.*, c.church_name
+       FROM pre_events pe
+       JOIN churches c ON c.id = pe.church_id
+       WHERE pe.slug = $1`,
       [req.params.slug]
     );
 
@@ -588,10 +639,26 @@ exports.submitPublicRsvp = async (req, res) => {
       ]
     );
 
+    const rsvp = result.rows[0];
+    const emailToken = generateRsvpCheckinToken();
+    let qrEmail = { sent: false };
+    try {
+      qrEmail = await sendCheckinQrForRsvp({ preEvent, rsvp, token: emailToken });
+    } catch (emailError) {
+      console.error('RSVP QR email send failed:', emailError.message);
+      qrEmail = { sent: false, reason: emailError.message };
+    }
+
     return res.status(201).json({
       success: true,
       message: 'Your access is secured. See you there!',
-      rsvp: mapRsvp(result.rows[0])
+      qrEmailSent: Boolean(qrEmail.sent),
+      rsvp: mapRsvp({
+        ...rsvp,
+        checkin_token_hash: qrEmail.sent ? qrEmail.tokenHash : rsvp.checkin_token_hash,
+        checkin_qr_sent_at: qrEmail.sent ? new Date() : rsvp.checkin_qr_sent_at,
+        checkin_qr_last_sent_at: qrEmail.sent ? new Date() : rsvp.checkin_qr_last_sent_at
+      })
     });
   } catch (error) {
     if (error.code === '23505') {
@@ -605,5 +672,45 @@ exports.submitPublicRsvp = async (req, res) => {
 
     console.error('Submit public RSVP error:', error);
     return res.status(500).json({ error: 'Server error submitting RSVP.' });
+  }
+};
+
+exports.resendRsvpQrEmail = async (req, res) => {
+  try {
+    const preEvent = await getOwnedPreEventRow(req.churchId, req.params.id);
+    if (!preEvent) {
+      return res.status(404).json({ error: 'Pre-event not found.' });
+    }
+
+    const rsvpResult = await pool.query(
+      `SELECT *
+       FROM pre_event_rsvps
+       WHERE id = $1 AND pre_event_id = $2`,
+      [req.params.rsvpId, preEvent.id]
+    );
+
+    if (rsvpResult.rows.length === 0) {
+      return res.status(404).json({ error: 'RSVP record not found.' });
+    }
+
+    const rsvp = rsvpResult.rows[0];
+    if (rsvp.status === 'checked_in') {
+      return res.status(400).json({ error: 'This RSVP has already checked in.' });
+    }
+
+    const emailResult = await sendCheckinQrForRsvp({ preEvent, rsvp });
+    if (!emailResult.sent) {
+      return res.status(500).json({ error: emailResult.reason || 'Failed to send RSVP QR email.' });
+    }
+
+    const refreshed = await pool.query('SELECT * FROM pre_event_rsvps WHERE id = $1', [rsvp.id]);
+    return res.json({
+      success: true,
+      message: 'RSVP QR email resent.',
+      rsvp: mapRsvp(refreshed.rows[0])
+    });
+  } catch (error) {
+    console.error('Resend RSVP QR email error:', error);
+    return res.status(500).json({ error: 'Server error resending RSVP QR email.' });
   }
 };

@@ -70,6 +70,16 @@ router.post(
   programController.addManualAttendee
 );
 
+router.post(
+  '/:id/rsvp-qr-checkin',
+  auth,
+  [
+    body('token').notEmpty().withMessage('RSVP QR token is required'),
+    validate
+  ],
+  programController.checkInRsvpQr
+);
+
 // Get attendance over time (protected)
 router.get('/:id/attendance-data', auth, programController.getAttendanceOverTime);
 

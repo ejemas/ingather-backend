@@ -188,6 +188,9 @@ CREATE TABLE IF NOT EXISTS pre_event_rsvps (
     status VARCHAR(30) NOT NULL DEFAULT 'pre_registered',
     registration_type VARCHAR(30) NOT NULL DEFAULT 'rsvp',
     checked_in_at TIMESTAMP,
+    checkin_token_hash TEXT,
+    checkin_qr_sent_at TIMESTAMPTZ,
+    checkin_qr_last_sent_at TIMESTAMPTZ,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT pre_event_rsvps_status_check CHECK (status IN ('pre_registered', 'checked_in')),
@@ -210,8 +213,14 @@ ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS fellowship VARCHAR(100);
 ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS age INTEGER;
 ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS sex VARCHAR(20);
 ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checked_in_at TIMESTAMP;
+ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checkin_token_hash TEXT;
+ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checkin_qr_sent_at TIMESTAMPTZ;
+ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checkin_qr_last_sent_at TIMESTAMPTZ;
 ALTER TABLE pre_event_rsvps DROP CONSTRAINT IF EXISTS pre_event_rsvps_status_check;
 ALTER TABLE pre_event_rsvps ADD CONSTRAINT pre_event_rsvps_status_check CHECK (status IN ('pre_registered', 'checked_in'));
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pre_event_rsvps_checkin_token_hash
+  ON pre_event_rsvps(checkin_token_hash)
+  WHERE checkin_token_hash IS NOT NULL;
 
 ALTER TABLE attendees ADD COLUMN IF NOT EXISTS pre_event_rsvp_id INTEGER REFERENCES pre_event_rsvps(id) ON DELETE SET NULL;
 ALTER TABLE attendees ADD COLUMN IF NOT EXISTS status VARCHAR(30) NOT NULL DEFAULT 'checked_in';

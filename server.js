@@ -284,6 +284,9 @@ pool.query(`
     status VARCHAR(30) NOT NULL DEFAULT 'pre_registered',
     registration_type VARCHAR(30) NOT NULL DEFAULT 'rsvp',
     checked_in_at TIMESTAMP,
+    checkin_token_hash TEXT,
+    checkin_qr_sent_at TIMESTAMPTZ,
+    checkin_qr_last_sent_at TIMESTAMPTZ,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT pre_event_rsvps_status_check CHECK (status IN ('pre_registered', 'checked_in')),
@@ -305,6 +308,9 @@ pool.query(`
   ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS age INTEGER;
   ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS sex VARCHAR(20);
   ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checked_in_at TIMESTAMP;
+  ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checkin_token_hash TEXT;
+  ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checkin_qr_sent_at TIMESTAMPTZ;
+  ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checkin_qr_last_sent_at TIMESTAMPTZ;
   ALTER TABLE pre_event_rsvps DROP CONSTRAINT IF EXISTS pre_event_rsvps_status_check;
   ALTER TABLE pre_event_rsvps ADD CONSTRAINT pre_event_rsvps_status_check CHECK (status IN ('pre_registered', 'checked_in'));
   ALTER TABLE attendees ADD COLUMN IF NOT EXISTS pre_event_rsvp_id INTEGER REFERENCES pre_event_rsvps(id) ON DELETE SET NULL;
@@ -337,6 +343,7 @@ pool.query(`
   ALTER TABLE pre_events ENABLE ROW LEVEL SECURITY;
   ALTER TABLE pre_event_rsvps ENABLE ROW LEVEL SECURITY;
   CREATE UNIQUE INDEX IF NOT EXISTS idx_pre_event_rsvps_unique_email ON pre_event_rsvps(pre_event_id, email_address);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_pre_event_rsvps_checkin_token_hash ON pre_event_rsvps(checkin_token_hash) WHERE checkin_token_hash IS NOT NULL;
   CREATE UNIQUE INDEX IF NOT EXISTS idx_attendees_pre_event_rsvp_unique ON attendees(pre_event_rsvp_id) WHERE pre_event_rsvp_id IS NOT NULL;
   CREATE INDEX IF NOT EXISTS idx_pre_events_church_date ON pre_events(church_id, event_date DESC);
   CREATE INDEX IF NOT EXISTS idx_pre_events_program_id ON pre_events(program_id);

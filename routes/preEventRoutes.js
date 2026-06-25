@@ -42,6 +42,17 @@ router.get(
   preEventController.getPreEventById
 );
 
+router.post(
+  '/:id/rsvps/:rsvpId/resend-qr',
+  auth,
+  [
+    param('id').isInt().withMessage('Invalid pre-event ID'),
+    param('rsvpId').isInt().withMessage('Invalid RSVP ID'),
+    validate
+  ],
+  preEventController.resendRsvpQrEmail
+);
+
 router.put(
   '/:id',
   auth,
