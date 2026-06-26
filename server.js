@@ -71,6 +71,7 @@ const scanRoutes = require('./routes/scanRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
 const preEventRoutes = require('./routes/preEventRoutes');
 const waitlistRoutes = require('./routes/waitlistRoutes');
+const rsvpScannerRoutes = require('./routes/rsvpScannerRoutes');
 
 // API Routes
 app.get('/', (req, res) => {
@@ -83,6 +84,7 @@ app.use('/api/scan', scanRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/pre-events', preEventRoutes);
 app.use('/api/waitlist', waitlistRoutes);
+app.use('/api/rsvp-scanner', rsvpScannerRoutes);
 
 // Socket.io connection
 io.on('connection', (socket) => {

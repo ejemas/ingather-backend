@@ -11,8 +11,69 @@ const getPublicScanUrl = (programId) => (
   `${trimTrailingSlash(CANONICAL_PUBLIC_FRONTEND_ORIGIN)}/scan/${programId}`
 );
 
+const getPublicRsvpScannerUrl = (scannerToken) => (
+  `${trimTrailingSlash(CANONICAL_PUBLIC_FRONTEND_ORIGIN)}/rsvp-scanner/${scannerToken}`
+);
+
+const getRsvpScannerSecret = () => (
+  process.env.RSVP_SCANNER_SECRET || process.env.JWT_SECRET || 'ingather-rsvp-scanner-development-secret'
+);
+
+const signRsvpScannerPayload = (payload) => {
+  const encodedPayload = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const signature = crypto
+    .createHmac('sha256', getRsvpScannerSecret())
+    .update(encodedPayload)
+    .digest('base64url');
+  return `${encodedPayload}.${signature}`;
+};
+
+const verifyRsvpScannerToken = (scannerToken) => {
+  const [encodedPayload, signature] = String(scannerToken || '').split('.');
+  if (!encodedPayload || !signature) return null;
+
+  const expectedSignature = crypto
+    .createHmac('sha256', getRsvpScannerSecret())
+    .update(encodedPayload)
+    .digest('base64url');
+
+  const provided = Buffer.from(signature);
+  const expected = Buffer.from(expectedSignature);
+  if (provided.length !== expected.length || !crypto.timingSafeEqual(provided, expected)) {
+    return null;
+  }
+
+  try {
+    const payload = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString('utf8'));
+    const programId = Number(payload.programId);
+    const churchId = Number(payload.churchId);
+    if (!Number.isInteger(programId) || programId <= 0 || !Number.isInteger(churchId) || churchId <= 0) {
+      return null;
+    }
+    return { programId, churchId };
+  } catch (error) {
+    return null;
+  }
+};
+
+const createHttpError = (status, message, extra = {}) => {
+  const error = new Error(message);
+  error.status = status;
+  error.publicMessage = message;
+  Object.assign(error, extra);
+  return error;
+};
+
+const normalizeRsvpCheckinToken = (token) => (
+  String(token || '').trim().toUpperCase().replace(/[\s-]+/g, '')
+);
+
 const hashRsvpCheckinToken = (token) => (
   crypto.createHash('sha256').update(String(token || '')).digest('hex')
+);
+
+const hashNormalizedRsvpCheckinToken = (token) => (
+  crypto.createHash('sha256').update(normalizeRsvpCheckinToken(token)).digest('hex')
 );
 
 const extractRsvpCheckinToken = (value) => {
@@ -560,6 +621,171 @@ const getSharedDeviceCheckins = async (db, programId) => {
   );
 
   return parseInt(result.rows[0].shared_device_checkins, 10) || 0;
+};
+
+const checkInRsvpForProgram = async ({ programId, churchId, token, io }) => {
+  const client = await pool.connect();
+  let transactionStarted = false;
+
+  try {
+    const id = Number(programId);
+    const normalizedToken = extractRsvpCheckinToken(token);
+
+    if (!normalizedToken || normalizeRsvpCheckinToken(normalizedToken).length < 6) {
+      throw createHttpError(400, 'A valid RSVP QR token is required.');
+    }
+
+    const programResult = await client.query(
+      'SELECT * FROM programs WHERE id = $1 AND church_id = $2',
+      [id, churchId]
+    );
+
+    if (programResult.rows.length === 0) {
+      throw createHttpError(404, 'Program not found.');
+    }
+
+    const program = programResult.rows[0];
+    if (program.is_active === false) {
+      throw createHttpError(400, 'This event has ended, so RSVP QR check-ins are disabled.');
+    }
+
+    await client.query('BEGIN');
+    transactionStarted = true;
+
+    const tokenHash = hashNormalizedRsvpCheckinToken(normalizedToken);
+    const legacyTokenHash = hashRsvpCheckinToken(normalizedToken);
+    const rsvpResult = await client.query(
+      `SELECT per.*
+       FROM pre_event_rsvps per
+       JOIN pre_events pe ON pe.id = per.pre_event_id
+       WHERE pe.program_id = $1
+         AND pe.church_id = $2
+         AND per.checkin_token_hash = ANY($3::text[])
+       LIMIT 1
+       FOR UPDATE OF per`,
+      [id, churchId, [...new Set([tokenHash, legacyTokenHash])]]
+    );
+
+    if (rsvpResult.rows.length === 0) {
+      throw createHttpError(404, 'This RSVP QR code is not valid for this live event.');
+    }
+
+    const rsvp = rsvpResult.rows[0];
+    if (rsvp.status === 'checked_in') {
+      throw createHttpError(409, 'This RSVP has already checked in.', { alreadyCheckedIn: true });
+    }
+
+    const duplicateResult = await client.query(
+      'SELECT id FROM attendees WHERE pre_event_rsvp_id = $1 LIMIT 1',
+      [rsvp.id]
+    );
+
+    if (duplicateResult.rows.length > 0) {
+      throw createHttpError(409, 'This RSVP has already checked in.', { alreadyCheckedIn: true });
+    }
+
+    const checkedInAt = new Date();
+    const deviceFingerprint = `rsvp-qr-${id}-${rsvp.id}-${crypto.randomBytes(8).toString('hex')}`;
+    const firstTimer = Boolean(rsvp.first_timer);
+    const sex = cleanOptionalText(rsvp.sex);
+
+    const scanResult = await client.query(
+      `INSERT INTO scans
+       (program_id, device_fingerprint, gender, first_timer)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id`,
+      [id, deviceFingerprint, sex ? sex.toLowerCase() : null, firstTimer]
+    );
+
+    const updatedProgram = await client.query(
+      'UPDATE programs SET total_scans = total_scans + 1 WHERE id = $1 RETURNING total_scans',
+      [id]
+    );
+
+    const attendeeResult = await client.query(
+      `INSERT INTO attendees
+       (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer,
+        department, fellowship, age, sex, is_winner, device_fingerprint, scan_id, pre_event_rsvp_id,
+        status, registration_type, checked_in_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false, $14, $15, $16, 'checked_in', 'rsvp', $17)
+       RETURNING *`,
+      [
+        id,
+        cleanOptionalText(rsvp.full_name),
+        normalizeCollectedEmail(rsvp.email_address),
+        cleanOptionalText(rsvp.school),
+        cleanOptionalText(rsvp.link_url, 1000),
+        cleanOptionalText(rsvp.textarea_response, 5000),
+        cleanOptionalText(rsvp.phone_number, 50),
+        cleanOptionalText(rsvp.address, 1000),
+        firstTimer,
+        cleanOptionalText(rsvp.department, 100),
+        cleanOptionalText(rsvp.fellowship, 100),
+        rsvp.age || null,
+        sex,
+        deviceFingerprint,
+        scanResult.rows[0].id,
+        rsvp.id,
+        checkedInAt
+      ]
+    );
+
+    await client.query(
+      `UPDATE pre_event_rsvps
+       SET status = 'checked_in',
+           checked_in_at = $1,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2`,
+      [checkedInAt, rsvp.id]
+    );
+
+    const attendeeStats = await client.query(
+      `SELECT
+        COUNT(*) as total,
+        COUNT(CASE WHEN sex = 'Male' THEN 1 END) as male_count,
+        COUNT(CASE WHEN sex = 'Female' THEN 1 END) as female_count,
+        COUNT(CASE WHEN first_timer = true THEN 1 END) as first_timer_count
+       FROM attendees WHERE program_id = $1`,
+      [id]
+    );
+
+    const sharedDeviceCheckins = await getSharedDeviceCheckins(client, id);
+
+    await client.query('COMMIT');
+    transactionStarted = false;
+
+    const totalScans = parseInt(updatedProgram.rows[0].total_scans, 10);
+    const attendee = mapAttendee(attendeeResult.rows[0]);
+    const stats = {
+      attendeeMaleCount: parseInt(attendeeStats.rows[0].male_count, 10),
+      attendeeFemaleCount: parseInt(attendeeStats.rows[0].female_count, 10),
+      attendeeFirstTimerCount: parseInt(attendeeStats.rows[0].first_timer_count, 10),
+      attendeeTotal: parseInt(attendeeStats.rows[0].total, 10)
+    };
+
+    io?.emit(`program-${id}-update`, {
+      totalScans,
+      ...stats,
+      sharedDeviceCheckins,
+      timestamp: new Date()
+    });
+
+    return {
+      success: true,
+      attendee,
+      totalScans,
+      sharedDeviceCheckins,
+      ...stats
+    };
+  } catch (error) {
+    if (transactionStarted) await client.query('ROLLBACK');
+    if (error.code === '23505') {
+      throw createHttpError(409, 'This RSVP has already checked in.', { alreadyCheckedIn: true });
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
 };
 
 // Create Program
@@ -1312,175 +1538,121 @@ exports.addManualAttendee = async (req, res) => {
 };
 
 exports.checkInRsvpQr = async (req, res) => {
-  const client = await pool.connect();
-  let transactionStarted = false;
+  try {
+    const payload = await checkInRsvpForProgram({
+      programId: req.params.id,
+      churchId: req.churchId,
+      token: req.body.token,
+      io: req.app.get('io')
+    });
+    return res.status(201).json(payload);
+  } catch (error) {
+    console.error('RSVP QR check-in error:', error);
+    return res.status(error.status || 500).json({
+      error: error.publicMessage || 'Server error checking in RSVP QR.',
+      alreadyCheckedIn: Boolean(error.alreadyCheckedIn)
+    });
+  }
+};
 
+exports.getRsvpScannerLink = async (req, res) => {
   try {
     const { id } = req.params;
     const churchId = req.churchId;
-    const token = extractRsvpCheckinToken(req.body.token);
 
-    if (!token || token.length < 20) {
-      return res.status(400).json({ error: 'A valid RSVP QR token is required.' });
-    }
-
-    const programResult = await client.query(
-      'SELECT * FROM programs WHERE id = $1 AND church_id = $2',
+    const result = await pool.query(
+      `SELECT p.id, p.church_id, COUNT(pe.id) AS linked_pre_events
+       FROM programs p
+       LEFT JOIN pre_events pe ON pe.program_id = p.id
+       WHERE p.id = $1 AND p.church_id = $2
+       GROUP BY p.id, p.church_id`,
       [id, churchId]
     );
 
-    if (programResult.rows.length === 0) {
+    if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Program not found.' });
     }
 
-    const program = programResult.rows[0];
-    if (program.is_active === false) {
-      return res.status(400).json({ error: 'This event has ended, so RSVP QR check-ins are disabled.' });
+    if (parseInt(result.rows[0].linked_pre_events, 10) < 1) {
+      return res.status(400).json({ error: 'Link a Pre-Event to this live event before creating a scanner link.' });
     }
 
-    await client.query('BEGIN');
-    transactionStarted = true;
-
-    const tokenHash = hashRsvpCheckinToken(token);
-    const rsvpResult = await client.query(
-      `SELECT per.*
-       FROM pre_event_rsvps per
-       JOIN pre_events pe ON pe.id = per.pre_event_id
-       WHERE pe.program_id = $1
-         AND pe.church_id = $2
-         AND per.checkin_token_hash = $3
-       LIMIT 1
-       FOR UPDATE OF per`,
-      [id, churchId, tokenHash]
-    );
-
-    if (rsvpResult.rows.length === 0) {
-      await client.query('ROLLBACK');
-      transactionStarted = false;
-      return res.status(404).json({ error: 'This RSVP QR code is not valid for this live event.' });
-    }
-
-    const rsvp = rsvpResult.rows[0];
-    if (rsvp.status === 'checked_in') {
-      await client.query('ROLLBACK');
-      transactionStarted = false;
-      return res.status(409).json({ error: 'This RSVP has already checked in.', alreadyCheckedIn: true });
-    }
-
-    const duplicateResult = await client.query(
-      'SELECT id FROM attendees WHERE pre_event_rsvp_id = $1 LIMIT 1',
-      [rsvp.id]
-    );
-
-    if (duplicateResult.rows.length > 0) {
-      await client.query('ROLLBACK');
-      transactionStarted = false;
-      return res.status(409).json({ error: 'This RSVP has already checked in.', alreadyCheckedIn: true });
-    }
-
-    const checkedInAt = new Date();
-    const deviceFingerprint = `rsvp-qr-${id}-${rsvp.id}-${crypto.randomBytes(8).toString('hex')}`;
-    const firstTimer = Boolean(rsvp.first_timer);
-    const sex = cleanOptionalText(rsvp.sex);
-
-    const scanResult = await client.query(
-      `INSERT INTO scans
-       (program_id, device_fingerprint, gender, first_timer)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id`,
-      [id, deviceFingerprint, sex ? sex.toLowerCase() : null, firstTimer]
-    );
-
-    const updatedProgram = await client.query(
-      'UPDATE programs SET total_scans = total_scans + 1 WHERE id = $1 RETURNING total_scans',
-      [id]
-    );
-
-    const attendeeResult = await client.query(
-      `INSERT INTO attendees
-       (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer,
-        department, fellowship, age, sex, is_winner, device_fingerprint, scan_id, pre_event_rsvp_id,
-        status, registration_type, checked_in_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false, $14, $15, $16, 'checked_in', 'rsvp', $17)
-       RETURNING *`,
-      [
-        id,
-        cleanOptionalText(rsvp.full_name),
-        normalizeCollectedEmail(rsvp.email_address),
-        cleanOptionalText(rsvp.school),
-        cleanOptionalText(rsvp.link_url, 1000),
-        cleanOptionalText(rsvp.textarea_response, 5000),
-        cleanOptionalText(rsvp.phone_number, 50),
-        cleanOptionalText(rsvp.address, 1000),
-        firstTimer,
-        cleanOptionalText(rsvp.department, 100),
-        cleanOptionalText(rsvp.fellowship, 100),
-        rsvp.age || null,
-        sex,
-        deviceFingerprint,
-        scanResult.rows[0].id,
-        rsvp.id,
-        checkedInAt
-      ]
-    );
-
-    await client.query(
-      `UPDATE pre_event_rsvps
-       SET status = 'checked_in',
-           checked_in_at = $1,
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $2`,
-      [checkedInAt, rsvp.id]
-    );
-
-    const attendeeStats = await client.query(
-      `SELECT
-        COUNT(*) as total,
-        COUNT(CASE WHEN sex = 'Male' THEN 1 END) as male_count,
-        COUNT(CASE WHEN sex = 'Female' THEN 1 END) as female_count,
-        COUNT(CASE WHEN first_timer = true THEN 1 END) as first_timer_count
-       FROM attendees WHERE program_id = $1`,
-      [id]
-    );
-
-    const sharedDeviceCheckins = await getSharedDeviceCheckins(client, id);
-
-    await client.query('COMMIT');
-    transactionStarted = false;
-
-    const totalScans = parseInt(updatedProgram.rows[0].total_scans, 10);
-    const attendee = mapAttendee(attendeeResult.rows[0]);
-    const stats = {
-      attendeeMaleCount: parseInt(attendeeStats.rows[0].male_count, 10),
-      attendeeFemaleCount: parseInt(attendeeStats.rows[0].female_count, 10),
-      attendeeFirstTimerCount: parseInt(attendeeStats.rows[0].first_timer_count, 10),
-      attendeeTotal: parseInt(attendeeStats.rows[0].total, 10)
-    };
-
-    const io = req.app.get('io');
-    io?.emit(`program-${id}-update`, {
-      totalScans,
-      ...stats,
-      sharedDeviceCheckins,
-      timestamp: new Date()
+    const scannerToken = signRsvpScannerPayload({
+      programId: Number(result.rows[0].id),
+      churchId: Number(result.rows[0].church_id),
+      iat: Date.now()
     });
 
-    return res.status(201).json({
-      success: true,
-      attendee,
-      totalScans,
-      sharedDeviceCheckins,
-      ...stats
+    return res.json({
+      scannerToken,
+      scannerUrl: getPublicRsvpScannerUrl(scannerToken)
     });
   } catch (error) {
-    if (transactionStarted) await client.query('ROLLBACK');
-    console.error('RSVP QR check-in error:', error);
-    if (error.code === '23505') {
-      return res.status(409).json({ error: 'This RSVP has already checked in.', alreadyCheckedIn: true });
+    console.error('Get RSVP scanner link error:', error);
+    return res.status(500).json({ error: 'Server error creating RSVP scanner link.' });
+  }
+};
+
+exports.getPublicRsvpScanner = async (req, res) => {
+  try {
+    const payload = verifyRsvpScannerToken(req.params.scannerToken);
+    if (!payload) {
+      return res.status(404).json({ error: 'This RSVP scanner link is invalid.' });
     }
-    return res.status(500).json({ error: 'Server error checking in RSVP QR.' });
-  } finally {
-    client.release();
+
+    const result = await pool.query(
+      `SELECT p.id, p.title, p.date, p.start_time, p.end_time, p.is_active, c.church_name, COUNT(pe.id) AS linked_pre_events
+       FROM programs p
+       JOIN churches c ON c.id = p.church_id
+       LEFT JOIN pre_events pe ON pe.program_id = p.id
+       WHERE p.id = $1 AND p.church_id = $2
+       GROUP BY p.id, c.church_name`,
+      [payload.programId, payload.churchId]
+    );
+
+    if (result.rows.length === 0 || parseInt(result.rows[0].linked_pre_events, 10) < 1) {
+      return res.status(404).json({ error: 'This RSVP scanner link is no longer available.' });
+    }
+
+    const program = result.rows[0];
+    return res.json({
+      program: {
+        id: program.id,
+        title: program.title,
+        date: program.date,
+        startTime: program.start_time,
+        endTime: program.end_time,
+        isActive: program.is_active,
+        organizerName: program.church_name
+      }
+    });
+  } catch (error) {
+    console.error('Get public RSVP scanner error:', error);
+    return res.status(500).json({ error: 'Server error loading RSVP scanner.' });
+  }
+};
+
+exports.publicRsvpScannerCheckIn = async (req, res) => {
+  try {
+    const payload = verifyRsvpScannerToken(req.params.scannerToken);
+    if (!payload) {
+      return res.status(404).json({ error: 'This RSVP scanner link is invalid.' });
+    }
+
+    const response = await checkInRsvpForProgram({
+      programId: payload.programId,
+      churchId: payload.churchId,
+      token: req.body.token,
+      io: req.app.get('io')
+    });
+
+    return res.status(201).json(response);
+  } catch (error) {
+    console.error('Public RSVP scanner check-in error:', error);
+    return res.status(error.status || 500).json({
+      error: error.publicMessage || 'Server error checking in RSVP QR.',
+      alreadyCheckedIn: Boolean(error.alreadyCheckedIn)
+    });
   }
 };
 

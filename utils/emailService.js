@@ -127,7 +127,7 @@ const sendWaitlistInviteEmail = async ({ email, firstName, inviteLink }) => {
   return { sent: true };
 };
 
-const sendRsvpQrEmail = async ({ email, attendeeName, eventTitle, eventDate, organizerName, qrDataUrl, checkinLink }) => {
+const sendRsvpQrEmail = async ({ email, attendeeName, eventTitle, eventDate, organizerName, qrImageUrl, checkinLink, checkinToken }) => {
   if (!resend) {
     return { sent: false, reason: 'RESEND_API_KEY is not configured' };
   }
@@ -158,10 +158,21 @@ const sendRsvpQrEmail = async ({ email, attendeeName, eventTitle, eventDate, org
           <p style="color: #F96D10; font-weight: 800; text-transform: uppercase; font-size: 12px; letter-spacing: .08em; margin: 0 0 12px;">Pre-event access confirmed</p>
           <h2 style="margin: 0 0 12px; font-size: 25px;">Hi ${safeName}, your check-in QR is ready.</h2>
           <p style="color: rgba(255,255,255,.74); line-height: 1.65; margin: 0 0 22px;">
-            Bring this QR code to <strong style="color:#fff;">${eventTitle}</strong>. ${safeOrganizer} will scan it at the entrance to check you in quickly.
+            Bring this QR code to <strong style="color:#fff;">${eventTitle}</strong>. ${safeOrganizer} will scan it at the entrance to check you in quickly. If scanning fails, give the RSVP token below to the usher.
           </p>
-          <div style="background:#ffffff; border-radius: 18px; padding: 20px; text-align:center; margin: 24px auto; max-width: 280px;">
-            <img src="${qrDataUrl}" alt="Personal check-in QR code" width="220" height="220" style="display:block; margin:0 auto;" />
+          ${qrImageUrl ? `
+            <div style="background:#ffffff; border-radius: 18px; padding: 20px; text-align:center; margin: 24px auto; max-width: 280px;">
+              <img src="${qrImageUrl}" alt="Personal check-in QR code" width="220" height="220" style="display:block; margin:0 auto;" />
+            </div>
+          ` : `
+            <div style="background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.12); border-radius: 16px; padding: 18px; text-align:center; margin: 24px 0;">
+              <p style="margin:0; color:rgba(255,255,255,.72);">Your QR image could not be attached, but your secure fallback link and RSVP token below will still work at check-in.</p>
+            </div>
+          `}
+          <div style="background: rgba(249,109,16,.13); border: 1px solid rgba(249,109,16,.38); border-radius: 16px; padding: 18px; text-align:center; margin: 0 0 22px;">
+            <p style="margin:0 0 8px; color:#F96D10; font-size:12px; font-weight:800; text-transform:uppercase; letter-spacing:.08em;">RSVP Token</p>
+            <strong style="display:block; color:#ffffff; font-size:30px; letter-spacing:.18em; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;">${checkinToken || ''}</strong>
+            <p style="margin:10px 0 0; color:rgba(255,255,255,.64); font-size:13px;">Use this token only if the QR scanner is unavailable.</p>
           </div>
           <div style="background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.12); border-radius: 14px; padding: 16px; margin-bottom: 22px;">
             <p style="margin:0; color:rgba(255,255,255,.62); font-size:13px;">Event</p>

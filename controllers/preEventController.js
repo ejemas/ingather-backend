@@ -45,10 +45,19 @@ const getPublicRsvpUrl = (slug) => `${trimTrailingSlash(PUBLIC_FRONTEND_ORIGIN)}
 
 const getRsvpCheckinUrl = (token) => `${trimTrailingSlash(PUBLIC_FRONTEND_ORIGIN)}/rsvp-checkin/${token}`;
 
-const generateRsvpCheckinToken = () => crypto.randomBytes(32).toString('base64url');
+const RSVP_TOKEN_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+const normalizeRsvpCheckinToken = (token) => (
+  String(token || '').trim().toUpperCase().replace(/[\s-]+/g, '')
+);
+
+const generateRsvpCheckinToken = () => {
+  const bytes = crypto.randomBytes(8);
+  return Array.from(bytes, byte => RSVP_TOKEN_ALPHABET[byte % RSVP_TOKEN_ALPHABET.length]).join('');
+};
 
 const hashRsvpCheckinToken = (token) => (
-  crypto.createHash('sha256').update(String(token || '')).digest('hex')
+  crypto.createHash('sha256').update(normalizeRsvpCheckinToken(token)).digest('hex')
 );
 
 const cleanText = (value, maxLength = 255) => {
@@ -172,7 +181,7 @@ const mapRsvp = (row) => ({
 });
 
 const sendCheckinQrForRsvp = async ({ preEvent, rsvp, token }) => {
-  const checkinToken = token || generateRsvpCheckinToken();
+  const checkinToken = normalizeRsvpCheckinToken(token || generateRsvpCheckinToken());
   const checkinTokenHash = hashRsvpCheckinToken(checkinToken);
   const checkinLink = getRsvpCheckinUrl(checkinToken);
   const qrDataUrl = await QRCode.toDataURL(checkinLink, {
@@ -180,6 +189,18 @@ const sendCheckinQrForRsvp = async ({ preEvent, rsvp, token }) => {
     margin: 2,
     width: 320
   });
+  let qrImageUrl = null;
+
+  try {
+    const uploadedQr = await uploadEventFlyer({
+      churchId: preEvent.church_id,
+      dataUrl: qrDataUrl,
+      folder: 'rsvp-qr'
+    });
+    qrImageUrl = uploadedQr.flyerUrl;
+  } catch (uploadError) {
+    console.error('RSVP QR image upload failed:', uploadError.message);
+  }
 
   const emailResult = await sendRsvpQrEmail({
     email: rsvp.email_address,
@@ -187,8 +208,9 @@ const sendCheckinQrForRsvp = async ({ preEvent, rsvp, token }) => {
     eventTitle: preEvent.title,
     eventDate: preEvent.event_date,
     organizerName: preEvent.church_name,
-    qrDataUrl,
-    checkinLink
+    qrImageUrl,
+    checkinLink,
+    checkinToken
   });
 
   if (emailResult.sent) {
