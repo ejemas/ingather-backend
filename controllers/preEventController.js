@@ -65,6 +65,13 @@ const cleanText = (value, maxLength = 255) => {
   return value.trim().slice(0, maxLength);
 };
 
+const parseBoolean = (value, fallback = false) => {
+  if (typeof value === 'boolean') return value;
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  return fallback;
+};
+
 const normalizeEmail = (value) => cleanText(value, 255).toLowerCase();
 
 const isValidEmail = (value) => {
@@ -141,14 +148,18 @@ const mapPreEvent = (row, extras = {}) => ({
   title: row.title,
   eventDate: row.event_date,
   description: row.description || '',
+  venueName: row.venue_name || '',
+  city: row.city || '',
   bannerUrl: row.banner_url || null,
   bannerOriginalName: row.banner_original_name || null,
   rsvpFields: normalizeRsvpFields(row.rsvp_fields || {}),
   rsvpFieldConfig: normalizeFieldConfig(row.rsvp_field_config || {}),
   slug: row.slug,
   publicUrl: getPublicRsvpUrl(row.slug),
+  discoverEnabled: row.discover_enabled === true,
   isRsvpActive: row.is_rsvp_active !== false,
   rsvpCount: parseInt(row.rsvp_count || extras.rsvpCount || 0, 10),
+  churchName: row.church_name || row.organizer_name || '',
   createdAt: row.created_at,
   updatedAt: row.updated_at
 });
@@ -358,6 +369,9 @@ exports.createPreEvent = async (req, res) => {
     const title = cleanText(req.body.title, 255);
     const eventDate = parseEventDate(req.body.eventDate);
     const description = cleanText(req.body.description, 5000);
+    const venueName = cleanText(req.body.venueName, 255);
+    const city = cleanText(req.body.city, 120);
+    const discoverEnabled = parseBoolean(req.body.discoverEnabled, false);
     const rsvpFields = normalizeRsvpFields(req.body.rsvpFields);
     const rsvpFieldConfig = normalizeFieldConfig(req.body.rsvpFieldConfig || {});
     const isRsvpActive = req.body.isRsvpActive !== false;
@@ -383,10 +397,10 @@ exports.createPreEvent = async (req, res) => {
 
     const result = await pool.query(
       `INSERT INTO pre_events (
-        church_id, program_id, title, event_date, description, banner_url, banner_storage_path,
-        banner_original_name, rsvp_fields, rsvp_field_config, slug, is_rsvp_active
+        church_id, program_id, title, event_date, description, venue_name, city, discover_enabled,
+        banner_url, banner_storage_path, banner_original_name, rsvp_fields, rsvp_field_config, slug, is_rsvp_active
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11, $12)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::jsonb, $14, $15)
       RETURNING *`,
       [
         req.churchId,
@@ -394,6 +408,9 @@ exports.createPreEvent = async (req, res) => {
         title,
         eventDate,
         description || null,
+        venueName || null,
+        city || null,
+        discoverEnabled,
         uploadedBanner?.flyerUrl || null,
         uploadedBanner?.flyerStoragePath || null,
         cleanText(req.body.banner?.originalName, 255) || null,
@@ -495,6 +512,8 @@ exports.updatePreEvent = async (req, res) => {
     const title = cleanText(req.body.title ?? existing.title, 255);
     const eventDate = parseEventDate(req.body.eventDate ?? existing.event_date);
     const description = cleanText(req.body.description ?? existing.description, 5000);
+    const venueName = cleanText(req.body.venueName ?? existing.venue_name, 255);
+    const city = cleanText(req.body.city ?? existing.city, 120);
     const rsvpFields = normalizeRsvpFields(req.body.rsvpFields || existing.rsvp_fields);
     const rsvpFieldConfig = normalizeFieldConfig(req.body.rsvpFieldConfig || existing.rsvp_field_config || {});
     const linkedProgramId = Object.prototype.hasOwnProperty.call(req.body, 'programId')
@@ -503,6 +522,9 @@ exports.updatePreEvent = async (req, res) => {
     const isRsvpActive = typeof req.body.isRsvpActive === 'boolean'
       ? req.body.isRsvpActive
       : existing.is_rsvp_active !== false;
+    const discoverEnabled = typeof req.body.discoverEnabled === 'boolean'
+      ? req.body.discoverEnabled
+      : existing.discover_enabled === true;
 
     if (!title) {
       return res.status(400).json({ error: 'Event name is required.' });
@@ -526,20 +548,26 @@ exports.updatePreEvent = async (req, res) => {
            program_id = $2,
            event_date = $3,
            description = $4,
-           banner_url = COALESCE($5, banner_url),
-           banner_storage_path = COALESCE($6, banner_storage_path),
-           banner_original_name = COALESCE($7, banner_original_name),
-           rsvp_fields = $8::jsonb,
-           rsvp_field_config = $9::jsonb,
-           is_rsvp_active = $10,
+           venue_name = $5,
+           city = $6,
+           discover_enabled = $7,
+           banner_url = COALESCE($8, banner_url),
+           banner_storage_path = COALESCE($9, banner_storage_path),
+           banner_original_name = COALESCE($10, banner_original_name),
+           rsvp_fields = $11::jsonb,
+           rsvp_field_config = $12::jsonb,
+           is_rsvp_active = $13,
            updated_at = CURRENT_TIMESTAMP
-       WHERE id = $11 AND church_id = $12
+       WHERE id = $14 AND church_id = $15
        RETURNING *`,
       [
         title,
         linkedProgramId,
         eventDate,
         description || null,
+        venueName || null,
+        city || null,
+        discoverEnabled,
         uploadedBanner?.flyerUrl || null,
         uploadedBanner?.flyerStoragePath || null,
         req.body.banner?.dataUrl ? cleanText(req.body.banner?.originalName, 255) || null : null,
@@ -596,9 +624,14 @@ exports.deletePreEvent = async (req, res) => {
 exports.getPublicPreEvent = async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, title, event_date, description, banner_url, rsvp_fields, rsvp_field_config, slug, is_rsvp_active
-       FROM pre_events
-       WHERE slug = $1`,
+      `SELECT pe.id, pe.title, pe.event_date, pe.description, pe.venue_name, pe.city,
+              pe.banner_url, pe.rsvp_fields, pe.rsvp_field_config, pe.slug, pe.is_rsvp_active,
+              pe.discover_enabled, c.church_name, COUNT(per.id) AS rsvp_count
+       FROM pre_events pe
+       JOIN churches c ON c.id = pe.church_id
+       LEFT JOIN pre_event_rsvps per ON per.pre_event_id = pe.id
+       WHERE pe.slug = $1
+       GROUP BY pe.id, c.church_name`,
       [req.params.slug]
     );
 
@@ -610,6 +643,42 @@ exports.getPublicPreEvent = async (req, res) => {
   } catch (error) {
     console.error('Get public pre-event error:', error);
     return res.status(500).json({ error: 'Server error fetching RSVP page.' });
+  }
+};
+
+exports.getDiscoverPreEvents = async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.limit || '24', 10) || 24, 1), 60);
+    const city = cleanText(req.query.city, 120);
+    const params = [limit];
+    let cityFilter = '';
+
+    if (city) {
+      params.push(city);
+      cityFilter = ` AND LOWER(pe.city) = LOWER($${params.length})`;
+    }
+
+    const result = await pool.query(
+      `SELECT pe.id, pe.title, pe.event_date, pe.description, pe.venue_name, pe.city,
+              pe.banner_url, pe.slug, pe.is_rsvp_active, pe.discover_enabled,
+              c.church_name, COUNT(per.id) AS rsvp_count
+       FROM pre_events pe
+       JOIN churches c ON c.id = pe.church_id
+       LEFT JOIN pre_event_rsvps per ON per.pre_event_id = pe.id
+       WHERE pe.discover_enabled = TRUE
+         AND pe.is_rsvp_active = TRUE
+         AND pe.event_date >= (CURRENT_TIMESTAMP - INTERVAL '12 hours')
+         ${cityFilter}
+       GROUP BY pe.id, c.church_name
+       ORDER BY pe.event_date ASC, pe.created_at DESC
+       LIMIT $1`,
+      params
+    );
+
+    return res.json({ preEvents: result.rows.map(mapPreEvent) });
+  } catch (error) {
+    console.error('Get discover pre-events error:', error);
+    return res.status(500).json({ error: 'Server error fetching discover events.' });
   }
 };
 

@@ -10,11 +10,16 @@ const preEventValidators = [
   body('title').notEmpty().withMessage('Event name is required'),
   body('eventDate').notEmpty().withMessage('Event date and time is required'),
   body('description').optional({ nullable: true }).isString().withMessage('Description must be text'),
+  body('venueName').optional({ nullable: true }).isString().withMessage('Venue name must be text'),
+  body('city').optional({ nullable: true }).isString().withMessage('City must be text'),
   body('programId').optional({ nullable: true, checkFalsy: true }).isInt().withMessage('Linked program must be a valid program'),
   body('rsvpFields').optional().isObject().withMessage('RSVP fields must be an object'),
   body('rsvpFieldConfig').optional().isObject().withMessage('RSVP field config must be an object'),
+  body('discoverEnabled').optional().isBoolean().withMessage('Discover visibility must be true or false'),
   body('isRsvpActive').optional().isBoolean().withMessage('RSVP active value must be true or false')
 ];
+
+router.get('/discover', preEventController.getDiscoverPreEvents);
 
 router.get(
   '/public/:slug',

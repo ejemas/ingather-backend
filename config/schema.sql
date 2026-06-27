@@ -140,6 +140,9 @@ CREATE TABLE IF NOT EXISTS pre_events (
     title VARCHAR(255) NOT NULL,
     event_date TIMESTAMP NOT NULL,
     description TEXT,
+    venue_name VARCHAR(255),
+    city VARCHAR(120),
+    discover_enabled BOOLEAN DEFAULT FALSE,
     banner_url TEXT,
     banner_storage_path TEXT,
     banner_original_name VARCHAR(255),
@@ -248,6 +251,9 @@ CREATE INDEX IF NOT EXISTS idx_waitlist_leads_status_created ON waitlist_leads (
 CREATE INDEX IF NOT EXISTS idx_waitlist_leads_invite_hash ON waitlist_leads (invite_token_hash) WHERE invite_token_hash IS NOT NULL;
 
 ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS program_id INTEGER REFERENCES programs(id) ON DELETE SET NULL;
+ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS venue_name VARCHAR(255);
+ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS city VARCHAR(120);
+ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS discover_enabled BOOLEAN DEFAULT FALSE;
 ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checked_in_at TIMESTAMP;
 ALTER TABLE attendees ADD COLUMN IF NOT EXISTS pre_event_rsvp_id INTEGER REFERENCES pre_event_rsvps(id) ON DELETE SET NULL;
 ALTER TABLE attendees ADD COLUMN IF NOT EXISTS status VARCHAR(30) NOT NULL DEFAULT 'checked_in';
@@ -325,5 +331,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_attendees_pre_event_rsvp_unique
 CREATE INDEX IF NOT EXISTS idx_pre_events_program_id ON pre_events(program_id);
 CREATE INDEX IF NOT EXISTS idx_attendees_program_checked_in ON attendees(program_id, checked_in_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pre_events_church_date ON pre_events(church_id, event_date DESC);
+CREATE INDEX IF NOT EXISTS idx_pre_events_discover_date ON pre_events(discover_enabled, is_rsvp_active, event_date ASC);
 CREATE INDEX IF NOT EXISTS idx_pre_events_slug ON pre_events(slug);
 CREATE INDEX IF NOT EXISTS idx_pre_event_rsvps_event_time ON pre_event_rsvps(pre_event_id, created_at DESC);
