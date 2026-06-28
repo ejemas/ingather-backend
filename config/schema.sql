@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS programs (
     tracking_mode VARCHAR(50) NOT NULL, -- 'count-only' or 'collect-data'
     data_fields JSONB, -- Store selected fields as JSON
     data_field_config JSONB DEFAULT '{}'::jsonb,
+    custom_form_schema JSONB DEFAULT '[]'::jsonb,
     gifting_enabled BOOLEAN DEFAULT FALSE,
     total_winners INTEGER DEFAULT 0,
     winners_selected INTEGER DEFAULT 0,
@@ -116,6 +117,7 @@ CREATE TABLE IF NOT EXISTS attendees (
     status VARCHAR(30) NOT NULL DEFAULT 'checked_in',
     registration_type VARCHAR(30) NOT NULL DEFAULT 'walk_in',
     checked_in_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    custom_responses JSONB DEFAULT '{}'::jsonb,
     scan_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -148,6 +150,7 @@ CREATE TABLE IF NOT EXISTS pre_events (
     banner_original_name VARCHAR(255),
     rsvp_fields JSONB NOT NULL DEFAULT '{"emailAddress":true}'::jsonb,
     rsvp_field_config JSONB DEFAULT '{}'::jsonb,
+    custom_form_schema JSONB DEFAULT '[]'::jsonb,
     slug VARCHAR(160) UNIQUE NOT NULL,
     is_rsvp_active BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

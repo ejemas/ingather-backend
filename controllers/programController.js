@@ -2,6 +2,7 @@ const pool = require('../config/database');
 const QRCode = require('qrcode');
 const crypto = require('crypto');
 const { uploadEventFlyer, deleteEventFlyer } = require('../utils/supabaseStorage');
+const { normalizeCustomFieldSchema, validateCustomResponses } = require('../utils/customFields');
 
 const CANONICAL_PUBLIC_FRONTEND_ORIGIN = 'https://ingather.app';
 
@@ -322,6 +323,7 @@ const mapProgramDetail = (program, counts = {}) => ({
   trackingMode: program.tracking_mode,
   dataFields: program.data_fields,
   dataFieldConfig: normalizeFieldConfig(program.data_field_config || {}),
+  customFormSchema: normalizeCustomFieldSchema(program.custom_form_schema || []),
   giftingEnabled: program.gifting_enabled,
   totalWinners: program.total_winners,
   winnersSelected: program.winners_selected,
@@ -367,6 +369,7 @@ const mapAttendee = (attendee) => ({
   status: attendee.status || 'checked_in',
   registrationType: attendee.registration_type || (attendee.proxy_host_fingerprint ? 'proxy' : attendee.device_fingerprint?.startsWith('manual-') ? 'manual' : 'walk_in'),
   checkedInAt: attendee.checked_in_at || attendee.scan_time,
+  customResponses: attendee.custom_responses || {},
   scanTime: attendee.scan_time
 });
 
@@ -706,8 +709,8 @@ const checkInRsvpForProgram = async ({ programId, churchId, token, io }) => {
       `INSERT INTO attendees
        (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer,
         department, fellowship, age, sex, is_winner, device_fingerprint, scan_id, pre_event_rsvp_id,
-        status, registration_type, checked_in_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false, $14, $15, $16, 'checked_in', 'rsvp', $17)
+        status, registration_type, checked_in_at, custom_responses)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false, $14, $15, $16, 'checked_in', 'rsvp', $17, $18::jsonb)
        RETURNING *`,
       [
         id,
@@ -726,7 +729,8 @@ const checkInRsvpForProgram = async ({ programId, churchId, token, io }) => {
         deviceFingerprint,
         scanResult.rows[0].id,
         rsvp.id,
-        checkedInAt
+        checkedInAt,
+        JSON.stringify(rsvp.custom_answers || {})
       ]
     );
 
@@ -799,6 +803,7 @@ exports.createProgram = async (req, res) => {
       trackingMode,
       dataFields,
       dataFieldConfig,
+      customFormSchema,
       enableGifting,
       numberOfWinners,
       eventFlyer,
@@ -822,6 +827,7 @@ exports.createProgram = async (req, res) => {
       : null;
     const resolvedDataFields = { ...(dataFields || {}) };
     const resolvedDataFieldConfig = normalizeFieldConfig(dataFieldConfig || {});
+    const resolvedCustomFormSchema = normalizeCustomFieldSchema(customFormSchema || []);
     const resolvedTrackingMode = flyerType === 'personalized' ? 'collect-data' : trackingMode;
     const normalizedProxyCheckinEnabled = resolvedTrackingMode === 'collect-data' && proxyCheckinEnabled === true;
     const normalizedStrictDeviceFingerprinting = resolvedTrackingMode !== 'collect-data' || strictDeviceFingerprinting !== false;
@@ -899,8 +905,8 @@ exports.createProgram = async (req, res) => {
 
       result = await client.query(
         `INSERT INTO programs
-         (church_id, title, date, start_time, end_time, tracking_mode, data_fields, data_field_config, gifting_enabled, total_winners, flyer_type, flyer_url, flyer_storage_path, flyer_original_name, personalized_flyer_config, personalized_background_url, personalized_background_storage_path, personalized_background_original_name, personalized_logo_url, personalized_logo_storage_path, personalized_logo_original_name, sponsor_display_mode, sponsor_expected_attendees, proxy_checkin_enabled, strict_device_fingerprinting)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+         (church_id, title, date, start_time, end_time, tracking_mode, data_fields, data_field_config, custom_form_schema, gifting_enabled, total_winners, flyer_type, flyer_url, flyer_storage_path, flyer_original_name, personalized_flyer_config, personalized_background_url, personalized_background_storage_path, personalized_background_original_name, personalized_logo_url, personalized_logo_storage_path, personalized_logo_original_name, sponsor_display_mode, sponsor_expected_attendees, proxy_checkin_enabled, strict_device_fingerprinting)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
          RETURNING *`,
         [
           churchId,
@@ -911,6 +917,7 @@ exports.createProgram = async (req, res) => {
           resolvedTrackingMode,
           JSON.stringify(resolvedDataFields),
           JSON.stringify(resolvedDataFieldConfig),
+          JSON.stringify(resolvedCustomFormSchema),
           enableGifting || false,
           numberOfWinners || 0,
           flyerType,
@@ -1428,6 +1435,9 @@ exports.addManualAttendee = async (req, res) => {
       errors.age = 'Age must be a valid number';
     }
 
+    const customValidation = validateCustomResponses(program.custom_form_schema || [], formData.customResponses || {});
+    Object.assign(errors, customValidation.errors);
+
     if (Object.keys(errors).length > 0) {
       await client.query('ROLLBACK');
       return res.status(400).json({ error: 'Please complete the required attendee fields', errors });
@@ -1469,8 +1479,8 @@ exports.addManualAttendee = async (req, res) => {
 
     const attendeeResult = await client.query(
       `INSERT INTO attendees
-       (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id, status, registration_type, checked_in_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'checked_in', 'manual', CURRENT_TIMESTAMP)
+       (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id, status, registration_type, checked_in_at, custom_responses)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'checked_in', 'manual', CURRENT_TIMESTAMP, $17::jsonb)
        RETURNING *`,
       [
         id,
@@ -1488,7 +1498,8 @@ exports.addManualAttendee = async (req, res) => {
         sex,
         isWinner,
         deviceFingerprint,
-        scanResult.rows[0].id
+        scanResult.rows[0].id,
+        JSON.stringify(customValidation.values)
       ]
     );
 

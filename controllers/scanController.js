@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const pool = require('../config/database');
+const { normalizeCustomFieldSchema, validateCustomResponses } = require('../utils/customFields');
 
 const SCAN_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -255,6 +256,7 @@ const mapFastTrackAttendee = (attendee) => ({
   status: attendee.status || 'checked_in',
   registrationType: attendee.registration_type || 'rsvp',
   checkedInAt: attendee.checked_in_at || attendee.scan_time,
+  customResponses: attendee.custom_responses || {},
   scanTime: attendee.scan_time
 });
 
@@ -475,6 +477,7 @@ exports.getProgramInfo = async (req, res) => {
       trackingMode: program.tracking_mode,
       dataFields: program.data_fields,
       dataFieldConfig: normalizeFieldConfig(program.data_field_config || {}),
+      customFormSchema: normalizeCustomFieldSchema(program.custom_form_schema || []),
       giftingEnabled: program.gifting_enabled,
       totalWinners: program.total_winners,
       winnersSelected: program.winners_selected,
@@ -548,6 +551,8 @@ exports.submitFormData = async (req, res) => {
     if (dataFields.school && !cleanText(formData.school)) errors.school = 'School is required';
     if (dataFields.link && !normalizeUrlField(formData.linkUrl || formData.link)) errors.linkUrl = 'Enter a valid link starting with http:// or https://';
     if (dataFields.textarea && !cleanText(formData.textareaResponse)) errors.textareaResponse = 'Response is required';
+    const customValidation = validateCustomResponses(program.custom_form_schema || [], formData.customResponses || {});
+    Object.assign(errors, customValidation.errors);
 
     if (Object.keys(errors).length > 0) {
       await client.query('ROLLBACK');
@@ -574,8 +579,8 @@ exports.submitFormData = async (req, res) => {
 
     await client.query(
       `INSERT INTO attendees
-       (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id, personalized_message, status, registration_type, checked_in_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'checked_in', 'walk_in', CURRENT_TIMESTAMP)`,
+       (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id, personalized_message, status, registration_type, checked_in_at, custom_responses)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'checked_in', 'walk_in', CURRENT_TIMESTAMP, $18::jsonb)`,
       [
         programId,
         formData.fullName || null,
@@ -593,7 +598,8 @@ exports.submitFormData = async (req, res) => {
         isWinner,
         session.deviceFingerprint,
         session.scan.id,
-        personalizedMessage
+        personalizedMessage,
+        JSON.stringify(customValidation.values)
       ]
     );
 
@@ -756,6 +762,7 @@ exports.submitFastTrackRsvp = async (req, res) => {
       school: rsvp.school || '',
       linkUrl: rsvp.link_url || '',
       textareaResponse: rsvp.textarea_response || '',
+      customResponses: rsvp.custom_answers || {},
       phoneNumber: rsvp.phone_number || '',
       address: rsvp.address || '',
       firstTimer: Boolean(rsvp.first_timer),
@@ -784,8 +791,8 @@ exports.submitFastTrackRsvp = async (req, res) => {
       `INSERT INTO attendees
        (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer,
         department, fellowship, age, sex, is_winner, device_fingerprint, scan_id,
-        personalized_message, pre_event_rsvp_id, status, registration_type, checked_in_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false, $14, $15, $16, $17, 'checked_in', 'rsvp', $18)
+        personalized_message, pre_event_rsvp_id, status, registration_type, checked_in_at, custom_responses)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false, $14, $15, $16, $17, 'checked_in', 'rsvp', $18, $19::jsonb)
        RETURNING *`,
       [
         programId,
@@ -805,7 +812,8 @@ exports.submitFastTrackRsvp = async (req, res) => {
         session.scan.id,
         personalizedMessage,
         rsvp.id,
-        checkedInAt
+        checkedInAt,
+        JSON.stringify(rsvp.custom_answers || {})
       ]
     );
 
@@ -939,6 +947,9 @@ exports.submitProxyAttendee = async (req, res) => {
     if (dataFields.department && !cleanText(formData.department)) errors.department = 'Department is required';
     if (dataFields.sex && !cleanText(formData.sex)) errors.sex = 'Please select gender';
 
+    const customValidation = validateCustomResponses(program.custom_form_schema || [], formData.customResponses || {});
+    Object.assign(errors, customValidation.errors);
+
     const age = formData.age === '' || formData.age === null || formData.age === undefined
       ? null
       : Number(formData.age);
@@ -976,8 +987,8 @@ exports.submitProxyAttendee = async (req, res) => {
 
     const attendeeResult = await client.query(
       `INSERT INTO attendees
-       (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, proxy_host_fingerprint, scan_id, status, registration_type, checked_in_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false, $14, $15, $16, 'checked_in', 'proxy', CURRENT_TIMESTAMP)
+       (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, proxy_host_fingerprint, scan_id, status, registration_type, checked_in_at, custom_responses)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false, $14, $15, $16, 'checked_in', 'proxy', CURRENT_TIMESTAMP, $17::jsonb)
        RETURNING *`,
       [
         programId,
@@ -995,7 +1006,8 @@ exports.submitProxyAttendee = async (req, res) => {
         sex,
         proxyDeviceFingerprint,
         hostDeviceFingerprint,
-        scanResult.rows[0].id
+        scanResult.rows[0].id,
+        JSON.stringify(customValidation.values)
       ]
     );
 

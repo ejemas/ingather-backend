@@ -268,11 +268,15 @@ CREATE INDEX IF NOT EXISTS idx_attendees_program_checked_in ON attendees(program
 
 -- Migration: Link and editable textarea data fields
 ALTER TABLE programs ADD COLUMN IF NOT EXISTS data_field_config JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE programs ADD COLUMN IF NOT EXISTS custom_form_schema JSONB DEFAULT '[]'::jsonb;
 ALTER TABLE attendees ADD COLUMN IF NOT EXISTS link_url TEXT;
 ALTER TABLE attendees ADD COLUMN IF NOT EXISTS textarea_response TEXT;
+ALTER TABLE attendees ADD COLUMN IF NOT EXISTS custom_responses JSONB DEFAULT '{}'::jsonb;
 ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS rsvp_field_config JSONB DEFAULT '{}'::jsonb;
+ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS custom_form_schema JSONB DEFAULT '[]'::jsonb;
 ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS link_url TEXT;
 ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS textarea_response TEXT;
+ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS custom_answers JSONB DEFAULT '{}'::jsonb;
 
 -- Migration: Invite-only waitlist leads
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
