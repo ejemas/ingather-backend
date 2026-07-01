@@ -267,6 +267,7 @@ pool.query(`
     rsvp_fields JSONB NOT NULL DEFAULT '{"emailAddress":true}'::jsonb,
     rsvp_field_config JSONB DEFAULT '{}'::jsonb,
     custom_form_schema JSONB DEFAULT '[]'::jsonb,
+    virtual_attendance_enabled BOOLEAN DEFAULT FALSE,
     slug VARCHAR(160) UNIQUE NOT NULL,
     is_rsvp_active BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -293,13 +294,15 @@ pool.query(`
     status VARCHAR(30) NOT NULL DEFAULT 'pre_registered',
     registration_type VARCHAR(30) NOT NULL DEFAULT 'rsvp',
     checked_in_at TIMESTAMP,
+    attendance_mode VARCHAR(20),
     checkin_token_hash TEXT,
     checkin_qr_sent_at TIMESTAMPTZ,
     checkin_qr_last_sent_at TIMESTAMPTZ,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT pre_event_rsvps_status_check CHECK (status IN ('pre_registered', 'checked_in')),
-    CONSTRAINT pre_event_rsvps_registration_type_check CHECK (registration_type IN ('rsvp'))
+    CONSTRAINT pre_event_rsvps_registration_type_check CHECK (registration_type IN ('rsvp')),
+    CONSTRAINT pre_event_rsvps_attendance_mode_check CHECK (attendance_mode IS NULL OR attendance_mode IN ('physical', 'virtual'))
   );
   ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS program_id INTEGER REFERENCES programs(id) ON DELETE SET NULL;
   ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS venue_name VARCHAR(255);
@@ -310,6 +313,7 @@ pool.query(`
   ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS rsvp_fields JSONB NOT NULL DEFAULT '{"emailAddress":true}'::jsonb;
   ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS rsvp_field_config JSONB DEFAULT '{}'::jsonb;
   ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS custom_form_schema JSONB DEFAULT '[]'::jsonb;
+  ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS virtual_attendance_enabled BOOLEAN DEFAULT FALSE;
   ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS is_rsvp_active BOOLEAN DEFAULT TRUE;
   ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS custom_answers JSONB DEFAULT '{}'::jsonb;
   ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS link_url TEXT;
@@ -324,13 +328,17 @@ pool.query(`
   ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checkin_token_hash TEXT;
   ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checkin_qr_sent_at TIMESTAMPTZ;
   ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checkin_qr_last_sent_at TIMESTAMPTZ;
+  ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS attendance_mode VARCHAR(20);
   ALTER TABLE pre_event_rsvps DROP CONSTRAINT IF EXISTS pre_event_rsvps_status_check;
   ALTER TABLE pre_event_rsvps ADD CONSTRAINT pre_event_rsvps_status_check CHECK (status IN ('pre_registered', 'checked_in'));
+  ALTER TABLE pre_event_rsvps DROP CONSTRAINT IF EXISTS pre_event_rsvps_attendance_mode_check;
+  ALTER TABLE pre_event_rsvps ADD CONSTRAINT pre_event_rsvps_attendance_mode_check CHECK (attendance_mode IS NULL OR attendance_mode IN ('physical', 'virtual'));
   ALTER TABLE attendees ADD COLUMN IF NOT EXISTS pre_event_rsvp_id INTEGER REFERENCES pre_event_rsvps(id) ON DELETE SET NULL;
   ALTER TABLE attendees ADD COLUMN IF NOT EXISTS custom_responses JSONB DEFAULT '{}'::jsonb;
   ALTER TABLE attendees ADD COLUMN IF NOT EXISTS status VARCHAR(30) NOT NULL DEFAULT 'checked_in';
   ALTER TABLE attendees ADD COLUMN IF NOT EXISTS registration_type VARCHAR(30) NOT NULL DEFAULT 'walk_in';
   ALTER TABLE attendees ADD COLUMN IF NOT EXISTS checked_in_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+  ALTER TABLE attendees ADD COLUMN IF NOT EXISTS attendance_mode VARCHAR(20) DEFAULT 'physical';
   UPDATE attendees SET status = 'checked_in' WHERE status IS NULL;
   UPDATE attendees SET registration_type = CASE
     WHEN proxy_host_fingerprint IS NOT NULL THEN 'proxy'
@@ -343,6 +351,8 @@ pool.query(`
   ALTER TABLE attendees ADD CONSTRAINT attendees_status_check CHECK (status IN ('pre_registered', 'checked_in'));
   ALTER TABLE attendees DROP CONSTRAINT IF EXISTS attendees_registration_type_check;
   ALTER TABLE attendees ADD CONSTRAINT attendees_registration_type_check CHECK (registration_type IN ('rsvp', 'walk_in', 'manual', 'proxy'));
+  ALTER TABLE attendees DROP CONSTRAINT IF EXISTS attendees_attendance_mode_check;
+  ALTER TABLE attendees ADD CONSTRAINT attendees_attendance_mode_check CHECK (attendance_mode IS NULL OR attendance_mode IN ('physical', 'virtual'));
   DO $$
   BEGIN
     IF NOT EXISTS (

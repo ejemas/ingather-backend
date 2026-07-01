@@ -255,6 +255,7 @@ const mapFastTrackAttendee = (attendee) => ({
   sex: attendee.sex || '',
   status: attendee.status || 'checked_in',
   registrationType: attendee.registration_type || 'rsvp',
+  attendanceMode: attendee.attendance_mode || 'physical',
   checkedInAt: attendee.checked_in_at || attendee.scan_time,
   customResponses: attendee.custom_responses || {},
   scanTime: attendee.scan_time
@@ -579,8 +580,8 @@ exports.submitFormData = async (req, res) => {
 
     await client.query(
       `INSERT INTO attendees
-       (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id, personalized_message, status, registration_type, checked_in_at, custom_responses)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'checked_in', 'walk_in', CURRENT_TIMESTAMP, $18::jsonb)`,
+       (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id, personalized_message, status, registration_type, checked_in_at, attendance_mode, custom_responses)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'checked_in', 'walk_in', CURRENT_TIMESTAMP, 'physical', $18::jsonb)`,
       [
         programId,
         formData.fullName || null,
@@ -791,8 +792,8 @@ exports.submitFastTrackRsvp = async (req, res) => {
       `INSERT INTO attendees
        (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer,
         department, fellowship, age, sex, is_winner, device_fingerprint, scan_id,
-        personalized_message, pre_event_rsvp_id, status, registration_type, checked_in_at, custom_responses)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false, $14, $15, $16, $17, 'checked_in', 'rsvp', $18, $19::jsonb)
+        personalized_message, pre_event_rsvp_id, status, registration_type, checked_in_at, attendance_mode, custom_responses)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false, $14, $15, $16, $17, 'checked_in', 'rsvp', $18, $19, $20::jsonb)
        RETURNING *`,
       [
         programId,
@@ -813,6 +814,7 @@ exports.submitFastTrackRsvp = async (req, res) => {
         personalizedMessage,
         rsvp.id,
         checkedInAt,
+        rsvp.attendance_mode || 'physical',
         JSON.stringify(rsvp.custom_answers || {})
       ]
     );
@@ -987,8 +989,8 @@ exports.submitProxyAttendee = async (req, res) => {
 
     const attendeeResult = await client.query(
       `INSERT INTO attendees
-       (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, proxy_host_fingerprint, scan_id, status, registration_type, checked_in_at, custom_responses)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false, $14, $15, $16, 'checked_in', 'proxy', CURRENT_TIMESTAMP, $17::jsonb)
+       (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, proxy_host_fingerprint, scan_id, status, registration_type, checked_in_at, attendance_mode, custom_responses)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false, $14, $15, $16, 'checked_in', 'proxy', CURRENT_TIMESTAMP, 'physical', $17::jsonb)
        RETURNING *`,
       [
         programId,

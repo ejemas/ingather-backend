@@ -16,6 +16,7 @@ const preEventValidators = [
   body('rsvpFields').optional().isObject().withMessage('RSVP fields must be an object'),
   body('rsvpFieldConfig').optional().isObject().withMessage('RSVP field config must be an object'),
   body('discoverEnabled').optional().isBoolean().withMessage('Discover visibility must be true or false'),
+  body('virtualAttendanceEnabled').optional().isBoolean().withMessage('Virtual attendance tracking must be true or false'),
   body('isRsvpActive').optional().isBoolean().withMessage('RSVP active value must be true or false')
 ];
 

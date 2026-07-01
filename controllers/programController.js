@@ -368,6 +368,7 @@ const mapAttendee = (attendee) => ({
   preEventRsvpId: attendee.pre_event_rsvp_id || null,
   status: attendee.status || 'checked_in',
   registrationType: attendee.registration_type || (attendee.proxy_host_fingerprint ? 'proxy' : attendee.device_fingerprint?.startsWith('manual-') ? 'manual' : 'walk_in'),
+  attendanceMode: attendee.attendance_mode || null,
   checkedInAt: attendee.checked_in_at || attendee.scan_time,
   customResponses: attendee.custom_responses || {},
   scanTime: attendee.scan_time
@@ -709,8 +710,8 @@ const checkInRsvpForProgram = async ({ programId, churchId, token, io }) => {
       `INSERT INTO attendees
        (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer,
         department, fellowship, age, sex, is_winner, device_fingerprint, scan_id, pre_event_rsvp_id,
-        status, registration_type, checked_in_at, custom_responses)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false, $14, $15, $16, 'checked_in', 'rsvp', $17, $18::jsonb)
+        status, registration_type, checked_in_at, attendance_mode, custom_responses)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, false, $14, $15, $16, 'checked_in', 'rsvp', $17, $18, $19::jsonb)
        RETURNING *`,
       [
         id,
@@ -730,6 +731,7 @@ const checkInRsvpForProgram = async ({ programId, churchId, token, io }) => {
         scanResult.rows[0].id,
         rsvp.id,
         checkedInAt,
+        rsvp.attendance_mode || 'physical',
         JSON.stringify(rsvp.custom_answers || {})
       ]
     );
@@ -1479,8 +1481,8 @@ exports.addManualAttendee = async (req, res) => {
 
     const attendeeResult = await client.query(
       `INSERT INTO attendees
-       (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id, status, registration_type, checked_in_at, custom_responses)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'checked_in', 'manual', CURRENT_TIMESTAMP, $17::jsonb)
+       (program_id, full_name, email_address, school, link_url, textarea_response, phone_number, address, first_timer, department, fellowship, age, sex, is_winner, device_fingerprint, scan_id, status, registration_type, checked_in_at, attendance_mode, custom_responses)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'checked_in', 'manual', CURRENT_TIMESTAMP, 'physical', $17::jsonb)
        RETURNING *`,
       [
         id,

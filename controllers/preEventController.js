@@ -143,6 +143,11 @@ const normalizeProgramId = (value) => {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 };
 
+const normalizeAttendanceMode = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  return ['physical', 'virtual'].includes(normalized) ? normalized : null;
+};
+
 const mapPreEvent = (row, extras = {}) => ({
   id: row.id,
   programId: row.program_id || null,
@@ -156,6 +161,7 @@ const mapPreEvent = (row, extras = {}) => ({
   rsvpFields: normalizeRsvpFields(row.rsvp_fields || {}),
   rsvpFieldConfig: normalizeFieldConfig(row.rsvp_field_config || {}),
   customFormSchema: normalizeCustomFieldSchema(row.custom_form_schema || []),
+  virtualAttendanceEnabled: row.virtual_attendance_enabled === true,
   slug: row.slug,
   publicUrl: getPublicRsvpUrl(row.slug),
   discoverEnabled: row.discover_enabled === true,
@@ -186,6 +192,7 @@ const mapRsvp = (row) => ({
   customAnswers: row.custom_answers || {},
   status: row.status || 'pre_registered',
   registrationType: row.registration_type || 'rsvp',
+  attendanceMode: row.attendance_mode || null,
   checkedInAt: row.checked_in_at || null,
   checkinQrSentAt: row.checkin_qr_sent_at || null,
   checkinQrLastSentAt: row.checkin_qr_last_sent_at || null,
@@ -265,7 +272,7 @@ const validateLinkedProgram = async (churchId, programId) => {
   return normalizedProgramId;
 };
 
-const validateRsvpPayload = (fields, customFormSchema = [], formData = {}) => {
+const validateRsvpPayload = (fields, customFormSchema = [], formData = {}, virtualAttendanceEnabled = false) => {
   const normalizedFields = normalizeRsvpFields(fields);
   const emailAddress = normalizeEmail(formData.emailAddress || formData.email);
 
@@ -287,8 +294,15 @@ const validateRsvpPayload = (fields, customFormSchema = [], formData = {}) => {
     department: null,
     fellowship: null,
     age: null,
-    sex: null
+    sex: null,
+    attendanceMode: null
   };
+
+  const attendanceMode = normalizeAttendanceMode(formData.attendanceMode);
+  if (virtualAttendanceEnabled && !attendanceMode) {
+    throw new Error('Please select how you will attend.');
+  }
+  payload.attendanceMode = virtualAttendanceEnabled ? attendanceMode : null;
 
   OPTIONAL_RSVP_FIELDS.forEach((field) => {
     if (field === 'link') {
@@ -387,6 +401,7 @@ exports.createPreEvent = async (req, res) => {
     const rsvpFields = normalizeRsvpFields(req.body.rsvpFields);
     const rsvpFieldConfig = normalizeFieldConfig(req.body.rsvpFieldConfig || {});
     const customFormSchema = normalizeCustomFieldSchema(req.body.customFormSchema || []);
+    const virtualAttendanceEnabled = parseBoolean(req.body.virtualAttendanceEnabled, false);
     const isRsvpActive = req.body.isRsvpActive !== false;
     const linkedProgramId = await validateLinkedProgram(req.churchId, req.body.programId);
 
@@ -411,9 +426,9 @@ exports.createPreEvent = async (req, res) => {
     const result = await pool.query(
       `INSERT INTO pre_events (
         church_id, program_id, title, event_date, description, venue_name, city, discover_enabled,
-        banner_url, banner_storage_path, banner_original_name, rsvp_fields, rsvp_field_config, custom_form_schema, slug, is_rsvp_active
+        banner_url, banner_storage_path, banner_original_name, rsvp_fields, rsvp_field_config, custom_form_schema, virtual_attendance_enabled, slug, is_rsvp_active
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::jsonb, $14::jsonb, $15, $16)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::jsonb, $14::jsonb, $15, $16, $17)
       RETURNING *`,
       [
         req.churchId,
@@ -430,6 +445,7 @@ exports.createPreEvent = async (req, res) => {
         JSON.stringify(rsvpFields),
         JSON.stringify(rsvpFieldConfig),
         JSON.stringify(customFormSchema),
+        virtualAttendanceEnabled,
         slug,
         isRsvpActive
       ]
@@ -535,6 +551,9 @@ exports.updatePreEvent = async (req, res) => {
         ? req.body.customFormSchema
         : existing.custom_form_schema || []
     );
+    const virtualAttendanceEnabled = typeof req.body.virtualAttendanceEnabled === 'boolean'
+      ? req.body.virtualAttendanceEnabled
+      : existing.virtual_attendance_enabled === true;
     const linkedProgramId = Object.prototype.hasOwnProperty.call(req.body, 'programId')
       ? await validateLinkedProgram(req.churchId, req.body.programId)
       : existing.program_id || null;
@@ -576,9 +595,10 @@ exports.updatePreEvent = async (req, res) => {
            rsvp_fields = $11::jsonb,
            rsvp_field_config = $12::jsonb,
            custom_form_schema = $13::jsonb,
-           is_rsvp_active = $14,
+           virtual_attendance_enabled = $14,
+           is_rsvp_active = $15,
            updated_at = CURRENT_TIMESTAMP
-       WHERE id = $15 AND church_id = $16
+       WHERE id = $16 AND church_id = $17
        RETURNING *`,
       [
         title,
@@ -594,6 +614,7 @@ exports.updatePreEvent = async (req, res) => {
         JSON.stringify(rsvpFields),
         JSON.stringify(rsvpFieldConfig),
         JSON.stringify(customFormSchema),
+        virtualAttendanceEnabled,
         isRsvpActive,
         existing.id,
         req.churchId
@@ -647,7 +668,7 @@ exports.getPublicPreEvent = async (req, res) => {
     const result = await pool.query(
       `SELECT pe.id, pe.title, pe.event_date, pe.description, pe.venue_name, pe.city,
               pe.banner_url, pe.rsvp_fields, pe.rsvp_field_config, pe.custom_form_schema, pe.slug, pe.is_rsvp_active,
-              pe.discover_enabled, c.church_name, COUNT(per.id) AS rsvp_count
+              pe.discover_enabled, pe.virtual_attendance_enabled, c.church_name, COUNT(per.id) AS rsvp_count
        FROM pre_events pe
        JOIN churches c ON c.id = pe.church_id
        LEFT JOIN pre_event_rsvps per ON per.pre_event_id = pe.id
@@ -682,7 +703,7 @@ exports.getDiscoverPreEvents = async (req, res) => {
     const result = await pool.query(
       `SELECT pe.id, pe.title, pe.event_date, pe.description, pe.venue_name, pe.city,
               pe.banner_url, pe.custom_form_schema, pe.slug, pe.is_rsvp_active, pe.discover_enabled,
-              c.church_name, COUNT(per.id) AS rsvp_count
+              pe.virtual_attendance_enabled, c.church_name, COUNT(per.id) AS rsvp_count
        FROM pre_events pe
        JOIN churches c ON c.id = pe.church_id
        LEFT JOIN pre_event_rsvps per ON per.pre_event_id = pe.id
@@ -722,15 +743,20 @@ exports.submitPublicRsvp = async (req, res) => {
       return res.status(403).json({ error: 'RSVPs are currently closed for this event.' });
     }
 
-    const payload = validateRsvpPayload(preEvent.rsvp_fields, preEvent.custom_form_schema || [], req.body.formData || req.body);
+    const payload = validateRsvpPayload(
+      preEvent.rsvp_fields,
+      preEvent.custom_form_schema || [],
+      req.body.formData || req.body,
+      preEvent.virtual_attendance_enabled === true
+    );
 
     const result = await pool.query(
       `INSERT INTO pre_event_rsvps (
         pre_event_id, email_address, full_name, phone_number, school,
         link_url, textarea_response, organization, ticket_type, address, first_timer,
-        department, fellowship, age, sex, custom_answers, status, registration_type
+        department, fellowship, age, sex, custom_answers, attendance_mode, status, registration_type
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, 'pre_registered', 'rsvp')
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, $17, 'pre_registered', 'rsvp')
       RETURNING *`,
       [
         preEvent.id,
@@ -748,7 +774,8 @@ exports.submitPublicRsvp = async (req, res) => {
         payload.fellowship,
         payload.age,
         payload.sex,
-        JSON.stringify(payload.customAnswers || {})
+        JSON.stringify(payload.customAnswers || {}),
+        payload.attendanceMode
       ]
     );
 
@@ -778,7 +805,7 @@ exports.submitPublicRsvp = async (req, res) => {
       return res.status(409).json({ error: 'This email has already secured access for this event.' });
     }
 
-    const isValidationError = /required|valid email|valid http|age must|valid gender|invalid option/i.test(error.message || '');
+    const isValidationError = /required|valid email|valid http|age must|valid gender|invalid option|select how/i.test(error.message || '');
     if (isValidationError) {
       return res.status(400).json({ error: error.message });
     }

@@ -117,6 +117,7 @@ CREATE TABLE IF NOT EXISTS attendees (
     status VARCHAR(30) NOT NULL DEFAULT 'checked_in',
     registration_type VARCHAR(30) NOT NULL DEFAULT 'walk_in',
     checked_in_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    attendance_mode VARCHAR(20) DEFAULT 'physical',
     custom_responses JSONB DEFAULT '{}'::jsonb,
     scan_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -151,6 +152,7 @@ CREATE TABLE IF NOT EXISTS pre_events (
     rsvp_fields JSONB NOT NULL DEFAULT '{"emailAddress":true}'::jsonb,
     rsvp_field_config JSONB DEFAULT '{}'::jsonb,
     custom_form_schema JSONB DEFAULT '[]'::jsonb,
+    virtual_attendance_enabled BOOLEAN DEFAULT FALSE,
     slug VARCHAR(160) UNIQUE NOT NULL,
     is_rsvp_active BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -179,13 +181,15 @@ CREATE TABLE IF NOT EXISTS pre_event_rsvps (
     status VARCHAR(30) NOT NULL DEFAULT 'pre_registered',
     registration_type VARCHAR(30) NOT NULL DEFAULT 'rsvp',
     checked_in_at TIMESTAMP,
+    attendance_mode VARCHAR(20),
     checkin_token_hash TEXT,
     checkin_qr_sent_at TIMESTAMPTZ,
     checkin_qr_last_sent_at TIMESTAMPTZ,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT pre_event_rsvps_status_check CHECK (status IN ('pre_registered', 'checked_in')),
-    CONSTRAINT pre_event_rsvps_registration_type_check CHECK (registration_type IN ('rsvp'))
+    CONSTRAINT pre_event_rsvps_registration_type_check CHECK (registration_type IN ('rsvp')),
+    CONSTRAINT pre_event_rsvps_attendance_mode_check CHECK (attendance_mode IS NULL OR attendance_mode IN ('physical', 'virtual'))
 );
 
 ALTER TABLE pre_events ENABLE ROW LEVEL SECURITY;
@@ -194,6 +198,13 @@ ALTER TABLE pre_event_rsvps ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checkin_token_hash TEXT;
 ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checkin_qr_sent_at TIMESTAMPTZ;
 ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checkin_qr_last_sent_at TIMESTAMPTZ;
+ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS virtual_attendance_enabled BOOLEAN DEFAULT FALSE;
+ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS attendance_mode VARCHAR(20);
+ALTER TABLE attendees ADD COLUMN IF NOT EXISTS attendance_mode VARCHAR(20) DEFAULT 'physical';
+ALTER TABLE attendees DROP CONSTRAINT IF EXISTS attendees_attendance_mode_check;
+ALTER TABLE attendees ADD CONSTRAINT attendees_attendance_mode_check CHECK (attendance_mode IS NULL OR attendance_mode IN ('physical', 'virtual'));
+ALTER TABLE pre_event_rsvps DROP CONSTRAINT IF EXISTS pre_event_rsvps_attendance_mode_check;
+ALTER TABLE pre_event_rsvps ADD CONSTRAINT pre_event_rsvps_attendance_mode_check CHECK (attendance_mode IS NULL OR attendance_mode IN ('physical', 'virtual'));
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pre_event_rsvps_checkin_token_hash
   ON pre_event_rsvps(checkin_token_hash)
   WHERE checkin_token_hash IS NOT NULL;
