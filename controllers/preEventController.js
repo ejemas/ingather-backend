@@ -369,6 +369,55 @@ const validateRsvpPayload = (fields, customFormSchema = [], formData = {}, virtu
   return payload;
 };
 
+const insertPreEventRsvp = async (preEvent, payload) => {
+  const result = await pool.query(
+    `INSERT INTO pre_event_rsvps (
+      pre_event_id, email_address, full_name, phone_number, school,
+      link_url, textarea_response, organization, ticket_type, address, first_timer,
+      department, fellowship, age, sex, custom_answers, attendance_mode, status, registration_type
+    )
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, $17, 'pre_registered', 'rsvp')
+    RETURNING *`,
+    [
+      preEvent.id,
+      payload.emailAddress,
+      payload.fullName,
+      payload.phoneNumber,
+      payload.school,
+      payload.linkUrl,
+      payload.textareaResponse,
+      payload.organization,
+      payload.ticketType,
+      payload.address,
+      payload.firstTimer,
+      payload.department,
+      payload.fellowship,
+      payload.age,
+      payload.sex,
+      JSON.stringify(payload.customAnswers || {}),
+      payload.attendanceMode
+    ]
+  );
+
+  return result.rows[0];
+};
+
+const sendAndRefreshRsvpQr = async (preEvent, rsvp, token) => {
+  const emailResult = await sendCheckinQrForRsvp({ preEvent, rsvp, token });
+  if (!emailResult.sent) return { emailResult, rsvp };
+
+  const refreshed = await pool.query('SELECT * FROM pre_event_rsvps WHERE id = $1', [rsvp.id]);
+  return {
+    emailResult,
+    rsvp: refreshed.rows[0] || {
+      ...rsvp,
+      checkin_token_hash: emailResult.tokenHash,
+      checkin_qr_sent_at: new Date(),
+      checkin_qr_last_sent_at: new Date()
+    }
+  };
+};
+
 const buildVelocity = (rows) => {
   const lookup = rows.reduce((map, row) => {
     map[row.date_key] = parseInt(row.count, 10);
@@ -750,40 +799,13 @@ exports.submitPublicRsvp = async (req, res) => {
       preEvent.virtual_attendance_enabled === true
     );
 
-    const result = await pool.query(
-      `INSERT INTO pre_event_rsvps (
-        pre_event_id, email_address, full_name, phone_number, school,
-        link_url, textarea_response, organization, ticket_type, address, first_timer,
-        department, fellowship, age, sex, custom_answers, attendance_mode, status, registration_type
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, $17, 'pre_registered', 'rsvp')
-      RETURNING *`,
-      [
-        preEvent.id,
-        payload.emailAddress,
-        payload.fullName,
-        payload.phoneNumber,
-        payload.school,
-        payload.linkUrl,
-        payload.textareaResponse,
-        payload.organization,
-        payload.ticketType,
-        payload.address,
-        payload.firstTimer,
-        payload.department,
-        payload.fellowship,
-        payload.age,
-        payload.sex,
-        JSON.stringify(payload.customAnswers || {}),
-        payload.attendanceMode
-      ]
-    );
-
-    const rsvp = result.rows[0];
+    let rsvp = await insertPreEventRsvp(preEvent, payload);
     const emailToken = generateRsvpCheckinToken();
     let qrEmail = { sent: false };
     try {
-      qrEmail = await sendCheckinQrForRsvp({ preEvent, rsvp, token: emailToken });
+      const sendResult = await sendAndRefreshRsvpQr(preEvent, rsvp, emailToken);
+      qrEmail = sendResult.emailResult;
+      rsvp = sendResult.rsvp;
     } catch (emailError) {
       console.error('RSVP QR email send failed:', emailError.message);
       qrEmail = { sent: false, reason: emailError.message };
@@ -793,12 +815,7 @@ exports.submitPublicRsvp = async (req, res) => {
       success: true,
       message: 'Your access is secured. See you there!',
       qrEmailSent: Boolean(qrEmail.sent),
-      rsvp: mapRsvp({
-        ...rsvp,
-        checkin_token_hash: qrEmail.sent ? qrEmail.tokenHash : rsvp.checkin_token_hash,
-        checkin_qr_sent_at: qrEmail.sent ? new Date() : rsvp.checkin_qr_sent_at,
-        checkin_qr_last_sent_at: qrEmail.sent ? new Date() : rsvp.checkin_qr_last_sent_at
-      })
+      rsvp: mapRsvp(rsvp)
     });
   } catch (error) {
     if (error.code === '23505') {
@@ -812,6 +829,59 @@ exports.submitPublicRsvp = async (req, res) => {
 
     console.error('Submit public RSVP error:', error);
     return res.status(500).json({ error: 'Server error submitting RSVP.' });
+  }
+};
+
+exports.createManualRsvp = async (req, res) => {
+  try {
+    const preEvent = await getOwnedPreEventRow(req.churchId, req.params.id);
+    if (!preEvent) {
+      return res.status(404).json({ error: 'Pre-event not found.' });
+    }
+
+    const payload = validateRsvpPayload(
+      preEvent.rsvp_fields,
+      preEvent.custom_form_schema || [],
+      req.body.formData || {},
+      preEvent.virtual_attendance_enabled === true
+    );
+
+    let rsvp = await insertPreEventRsvp(preEvent, payload);
+    let qrEmail = { sent: false };
+    const shouldSendQrEmail = req.body.sendQrEmail !== false;
+
+    if (shouldSendQrEmail) {
+      try {
+        const sendResult = await sendAndRefreshRsvpQr(preEvent, rsvp, generateRsvpCheckinToken());
+        qrEmail = sendResult.emailResult;
+        rsvp = sendResult.rsvp;
+      } catch (emailError) {
+        console.error('Manual RSVP QR email send failed:', emailError.message);
+        qrEmail = { sent: false, reason: emailError.message };
+      }
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: shouldSendQrEmail && !qrEmail.sent
+        ? 'RSVP added, but the QR email was not sent. You can resend it from the table.'
+        : 'RSVP added successfully.',
+      qrEmailSent: Boolean(qrEmail.sent),
+      emailWarning: shouldSendQrEmail && !qrEmail.sent ? (qrEmail.reason || 'QR email was not sent.') : null,
+      rsvp: mapRsvp(rsvp)
+    });
+  } catch (error) {
+    if (error.code === '23505') {
+      return res.status(409).json({ error: 'This email has already secured access for this event.' });
+    }
+
+    const isValidationError = /required|valid email|valid http|age must|valid gender|invalid option|select how/i.test(error.message || '');
+    if (isValidationError) {
+      return res.status(400).json({ error: error.message, customErrors: error.customErrors || null });
+    }
+
+    console.error('Create manual RSVP error:', error);
+    return res.status(500).json({ error: 'Server error adding RSVP manually.' });
   }
 };
 

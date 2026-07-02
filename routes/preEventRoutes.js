@@ -59,6 +59,18 @@ router.post(
   preEventController.resendRsvpQrEmail
 );
 
+router.post(
+  '/:id/rsvps/manual',
+  auth,
+  [
+    param('id').isInt().withMessage('Invalid pre-event ID'),
+    body('formData').optional().isObject().withMessage('RSVP form data must be an object'),
+    body('sendQrEmail').optional().isBoolean().withMessage('Send QR email must be true or false'),
+    validate
+  ],
+  preEventController.createManualRsvp
+);
+
 router.put(
   '/:id',
   auth,
