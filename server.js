@@ -78,6 +78,20 @@ app.get('/', (req, res) => {
   res.json({ message: 'Ingather API is running!' });
 });
 
+const getHealthPayload = () => ({
+  status: 'ok',
+  service: 'Ingather API',
+  time: new Date().toISOString()
+});
+
+app.get('/health', (req, res) => {
+  res.status(200).json(getHealthPayload());
+});
+
+app.get('/api/health', (req, res) => {
+  res.status(200).json(getHealthPayload());
+});
+
 app.use('/api/auth', authRoutes);
 app.use('/api/programs', programRoutes);
 app.use('/api/scan', scanRoutes);
