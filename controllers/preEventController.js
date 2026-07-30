@@ -2,10 +2,30 @@ const crypto = require('crypto');
 const QRCode = require('qrcode');
 const pool = require('../config/database');
 const { uploadEventFlyer, deleteEventFlyer } = require('../utils/supabaseStorage');
-const { sendRsvpQrEmail } = require('../utils/emailService');
+const { sendRsvpQrEmail, sendRsvpQrEmailBatch } = require('../utils/emailService');
 const { normalizeCustomFieldSchema, validateCustomResponses } = require('../utils/customFields');
+const {
+  MAX_RSVP_IMPORT_ROWS,
+  RSVP_IMPORT_CHUNK_SIZE,
+  validateRsvpImportRows
+} = require('../utils/rsvpImport');
+const {
+  QR_EMAIL_BATCH_LIMIT,
+  completeQrEmailBatch,
+  completeQrEmailSend,
+  failQrEmailSend,
+  getQrEmailQuota,
+  reserveImportedQrEmailBatch,
+  reserveQrEmailSend,
+  shouldApplyQrEmailQuota
+} = require('../utils/rsvpQrQuota');
+const {
+  RSVP_ANALYTICS_TIMEZONE,
+  buildRsvpAnalytics
+} = require('../utils/rsvpAnalytics');
 
 const PUBLIC_FRONTEND_ORIGIN = 'https://ingather.app';
+const QR_EMAIL_PREPARATION_CONCURRENCY = 5;
 
 const RSVP_FIELD_LABELS = {
   emailAddress: 'Email Address',
@@ -192,6 +212,7 @@ const mapRsvp = (row) => ({
   customAnswers: row.custom_answers || {},
   status: row.status || 'pre_registered',
   registrationType: row.registration_type || 'rsvp',
+  registrationSource: row.registration_source || 'legacy',
   attendanceMode: row.attendance_mode || null,
   checkedInAt: row.checked_in_at || null,
   checkinQrSentAt: row.checkin_qr_sent_at || null,
@@ -201,59 +222,163 @@ const mapRsvp = (row) => ({
 });
 
 const sendCheckinQrForRsvp = async ({ preEvent, rsvp, token }) => {
-  const checkinToken = normalizeRsvpCheckinToken(token || generateRsvpCheckinToken());
-  const checkinTokenHash = hashRsvpCheckinToken(checkinToken);
-  const checkinLink = getRsvpCheckinUrl(checkinToken);
-  const qrDataUrl = await QRCode.toDataURL(checkinLink, {
-    errorCorrectionLevel: 'M',
-    margin: 2,
-    width: 320
-  });
-  let qrImageUrl = null;
+  let reservationId = null;
 
   try {
+    if (shouldApplyQrEmailQuota(rsvp.registration_source)) {
+      const reservation = await reserveQrEmailSend({
+        churchId: preEvent.church_id,
+        preEventId: preEvent.id,
+        rsvpId: rsvp.id
+      });
+      reservationId = reservation.reservationId;
+    }
+
+    const checkinToken = normalizeRsvpCheckinToken(token || generateRsvpCheckinToken());
+    const checkinTokenHash = hashRsvpCheckinToken(checkinToken);
+    const checkinLink = getRsvpCheckinUrl(checkinToken);
+    const qrDataUrl = await QRCode.toDataURL(checkinLink, {
+      errorCorrectionLevel: 'M',
+      margin: 2,
+      width: 320
+    });
+    let qrImageUrl = null;
+
+    try {
+      const uploadedQr = await uploadEventFlyer({
+        churchId: preEvent.church_id,
+        dataUrl: qrDataUrl,
+        folder: 'rsvp-qr'
+      });
+      qrImageUrl = uploadedQr.flyerUrl;
+    } catch (uploadError) {
+      console.error('RSVP QR image upload failed:', uploadError.message);
+    }
+
+    const emailResult = await sendRsvpQrEmail({
+      email: rsvp.email_address,
+      attendeeName: rsvp.full_name,
+      eventTitle: preEvent.title,
+      eventDate: preEvent.event_date,
+      organizerName: preEvent.church_name,
+      qrImageUrl,
+      checkinLink,
+      checkinToken
+    });
+
+    if (!emailResult.sent) {
+      const quota = await failQrEmailSend(reservationId, emailResult.reason);
+      reservationId = null;
+      return { ...emailResult, tokenHash: checkinTokenHash, quota };
+    }
+
+    const quota = await completeQrEmailSend({
+      reservationId,
+      rsvpId: rsvp.id,
+      tokenHash: checkinTokenHash
+    });
+    reservationId = null;
+    return { ...emailResult, tokenHash: checkinTokenHash, quota };
+  } catch (error) {
+    if (reservationId) {
+      await failQrEmailSend(reservationId, error.message).catch(() => null);
+    }
+    throw error;
+  }
+};
+
+const mapWithConcurrency = async (items, concurrency, worker) => {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  const runWorker = async () => {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await worker(items[currentIndex], currentIndex);
+    }
+  };
+
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+  await Promise.all(Array.from({ length: workerCount }, runWorker));
+  return results;
+};
+
+const prepareImportedQrEmail = async (preEvent, rsvp) => {
+  try {
+    const checkinToken = generateRsvpCheckinToken();
+    const checkinTokenHash = hashRsvpCheckinToken(checkinToken);
+    const checkinLink = getRsvpCheckinUrl(checkinToken);
+    const qrDataUrl = await QRCode.toDataURL(checkinLink, {
+      errorCorrectionLevel: 'M',
+      margin: 2,
+      width: 320
+    });
     const uploadedQr = await uploadEventFlyer({
       churchId: preEvent.church_id,
       dataUrl: qrDataUrl,
       folder: 'rsvp-qr'
     });
-    qrImageUrl = uploadedQr.flyerUrl;
-  } catch (uploadError) {
-    console.error('RSVP QR image upload failed:', uploadError.message);
+
+    return {
+      prepared: true,
+      reservationId: rsvp.reservation_id,
+      rsvpId: rsvp.id,
+      emailAddress: rsvp.email_address,
+      tokenHash: checkinTokenHash,
+      qrStoragePath: uploadedQr.flyerStoragePath,
+      email: {
+        email: rsvp.email_address,
+        attendeeName: rsvp.full_name,
+        eventTitle: preEvent.title,
+        eventDate: preEvent.event_date,
+        organizerName: preEvent.church_name,
+        qrImageUrl: uploadedQr.flyerUrl,
+        checkinLink,
+        checkinToken
+      }
+    };
+  } catch (error) {
+    return {
+      prepared: false,
+      reservationId: rsvp.reservation_id,
+      rsvpId: rsvp.id,
+      emailAddress: rsvp.email_address,
+      reason: error.message || 'QR image preparation failed.'
+    };
   }
+};
 
-  const emailResult = await sendRsvpQrEmail({
-    email: rsvp.email_address,
-    attendeeName: rsvp.full_name,
-    eventTitle: preEvent.title,
-    eventDate: preEvent.event_date,
-    organizerName: preEvent.church_name,
-    qrImageUrl,
-    checkinLink,
-    checkinToken
-  });
-
-  if (emailResult.sent) {
-    await pool.query(
-      `UPDATE pre_event_rsvps
-       SET checkin_token_hash = $1,
-           checkin_qr_last_sent_at = CURRENT_TIMESTAMP,
-           checkin_qr_sent_at = COALESCE(checkin_qr_sent_at, CURRENT_TIMESTAMP),
-           updated_at = CURRENT_TIMESTAMP
-       WHERE id = $2`,
-      [checkinTokenHash, rsvp.id]
-    );
-  }
-
-  return { ...emailResult, tokenHash: checkinTokenHash };
+const cleanupPreparedQrAssets = async (items) => {
+  await Promise.allSettled(
+    items
+      .filter(item => item?.qrStoragePath)
+      .map(item => deleteEventFlyer(item.qrStoragePath))
+  );
 };
 
 const getOwnedPreEventRow = async (churchId, id) => {
   const result = await pool.query(
-    'SELECT * FROM pre_events WHERE id = $1 AND church_id = $2',
+    `SELECT pre_event.*, church.church_name
+     FROM pre_events pre_event
+     JOIN churches church ON church.id = pre_event.church_id
+     WHERE pre_event.id = $1 AND pre_event.church_id = $2`,
     [id, churchId]
   );
   return result.rows[0] || null;
+};
+
+const countRemainingImportedQrEmails = async (preEventId) => {
+  const result = await pool.query(
+    `SELECT COUNT(*) AS count
+     FROM pre_event_rsvps
+     WHERE pre_event_id = $1
+       AND registration_source = 'import'
+       AND checkin_qr_sent_at IS NULL
+       AND status = 'pre_registered'`,
+    [preEventId]
+  );
+  return parseInt(result.rows[0]?.count || '0', 10);
 };
 
 const validateLinkedProgram = async (churchId, programId) => {
@@ -369,14 +494,14 @@ const validateRsvpPayload = (fields, customFormSchema = [], formData = {}, virtu
   return payload;
 };
 
-const insertPreEventRsvp = async (preEvent, payload) => {
+const insertPreEventRsvp = async (preEvent, payload, registrationSource) => {
   const result = await pool.query(
     `INSERT INTO pre_event_rsvps (
       pre_event_id, email_address, full_name, phone_number, school,
       link_url, textarea_response, organization, ticket_type, address, first_timer,
-      department, fellowship, age, sex, custom_answers, attendance_mode, status, registration_type
+      department, fellowship, age, sex, custom_answers, attendance_mode, status, registration_type, registration_source
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, $17, 'pre_registered', 'rsvp')
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, $17, 'pre_registered', 'rsvp', $18)
     RETURNING *`,
     [
       preEvent.id,
@@ -395,7 +520,8 @@ const insertPreEventRsvp = async (preEvent, payload) => {
       payload.age,
       payload.sex,
       JSON.stringify(payload.customAnswers || {}),
-      payload.attendanceMode
+      payload.attendanceMode,
+      registrationSource
     ]
   );
 
@@ -416,25 +542,6 @@ const sendAndRefreshRsvpQr = async (preEvent, rsvp, token) => {
       checkin_qr_last_sent_at: new Date()
     }
   };
-};
-
-const buildVelocity = (rows) => {
-  const lookup = rows.reduce((map, row) => {
-    map[row.date_key] = parseInt(row.count, 10);
-    return map;
-  }, {});
-
-  return Array.from({ length: 14 }).map((_, index) => {
-    const date = new Date();
-    date.setHours(0, 0, 0, 0);
-    date.setDate(date.getDate() - (13 - index));
-    const dateKey = date.toISOString().slice(0, 10);
-    return {
-      date: dateKey,
-      label: date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
-      registrations: lookup[dateKey] || 0
-    };
-  });
 };
 
 exports.createPreEvent = async (req, res) => {
@@ -540,42 +647,336 @@ exports.getPreEventById = async (req, res) => {
       return res.status(404).json({ error: 'Pre-event not found.' });
     }
 
-    const [rsvpsResult, velocityResult] = await Promise.all([
+    const [rsvpsResult, qrEmailQuota] = await Promise.all([
       pool.query(
-        `SELECT *
-         FROM pre_event_rsvps
-         WHERE pre_event_id = $1
-         ORDER BY created_at DESC`,
-        [preEvent.id]
+        `SELECT per.*,
+                to_char(
+                  timezone($2, timezone(current_setting('TimeZone'), per.created_at)),
+                  'YYYY-MM-DD'
+                ) AS registration_date_key
+         FROM pre_event_rsvps per
+         WHERE per.pre_event_id = $1
+         ORDER BY per.created_at DESC`,
+        [preEvent.id, RSVP_ANALYTICS_TIMEZONE]
       ),
-      pool.query(
-        `SELECT to_char(created_at::date, 'YYYY-MM-DD') AS date_key, COUNT(*) AS count
-         FROM pre_event_rsvps
-         WHERE pre_event_id = $1
-           AND created_at >= (CURRENT_DATE - INTERVAL '13 days')
-         GROUP BY created_at::date
-         ORDER BY created_at::date ASC`,
-        [preEvent.id]
-      )
+      getQrEmailQuota(req.churchId)
     ]);
 
     const rsvps = rsvpsResult.rows.map(mapRsvp);
-    const todayKey = new Date().toISOString().slice(0, 10);
     return res.json({
       preEvent: mapPreEvent(preEvent, { rsvpCount: rsvps.length }),
       rsvps,
-      analytics: {
-        totalRsvps: rsvps.length,
-        todayRsvps: rsvps.filter((rsvp) => {
-          const submittedAt = new Date(rsvp.createdAt);
-          return !Number.isNaN(submittedAt.getTime()) && submittedAt.toISOString().slice(0, 10) === todayKey;
-        }).length,
-        velocity: buildVelocity(velocityResult.rows)
-      }
+      analytics: buildRsvpAnalytics(rsvpsResult.rows),
+      qrEmailQuota
     });
   } catch (error) {
     console.error('Get pre-event detail error:', error);
     return res.status(500).json({ error: 'Server error fetching pre-event.' });
+  }
+};
+
+exports.getQrEmailQuota = async (req, res) => {
+  try {
+    const quota = await getQrEmailQuota(req.churchId);
+    return res.json(quota);
+  } catch (error) {
+    console.error('Get RSVP QR email quota error:', error);
+    return res.status(500).json({ error: 'Unable to load the QR email allowance.' });
+  }
+};
+
+exports.importPreEventRsvps = async (req, res) => {
+  const client = await pool.connect();
+  let transactionStarted = false;
+
+  try {
+    const rows = req.body.rows;
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.status(400).json({ error: 'Add at least one attendee row to import.' });
+    }
+    if (rows.length > MAX_RSVP_IMPORT_ROWS) {
+      return res.status(400).json({ error: `A single import can contain at most ${MAX_RSVP_IMPORT_ROWS.toLocaleString()} attendees.` });
+    }
+
+    const validation = validateRsvpImportRows(rows);
+
+    await client.query('BEGIN');
+    transactionStarted = true;
+
+    const preEventResult = await client.query(
+      'SELECT id FROM pre_events WHERE id = $1 AND church_id = $2',
+      [req.params.id, req.churchId]
+    );
+    if (preEventResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(404).json({ error: 'Pre-event not found.' });
+    }
+
+    const lockResult = await client.query(
+      'SELECT pg_try_advisory_xact_lock($1::integer, $2::integer) AS acquired',
+      [Number(req.churchId), Number(req.params.id)]
+    );
+    if (!lockResult.rows[0]?.acquired) {
+      await client.query('ROLLBACK');
+      transactionStarted = false;
+      return res.status(409).json({ error: 'Another attendee import is already running for this event.' });
+    }
+
+    const errors = [...validation.errors];
+    let duplicateCount = validation.duplicateCount;
+    let candidates = validation.validRows;
+
+    if (candidates.length > 0) {
+      const existingResult = await client.query(
+        `SELECT email_address
+         FROM pre_event_rsvps
+         WHERE pre_event_id = $1
+           AND LOWER(email_address) = ANY($2::text[])`,
+        [req.params.id, candidates.map(row => row.emailAddress)]
+      );
+      const existingEmails = new Set(existingResult.rows.map(row => normalizeEmail(row.email_address)));
+
+      candidates = candidates.filter((row) => {
+        if (!existingEmails.has(row.emailAddress)) return true;
+        duplicateCount += 1;
+        errors.push({
+          sourceRow: row.sourceRow,
+          emailAddress: row.emailAddress,
+          type: 'duplicate',
+          reason: 'This email is already registered for the event.'
+        });
+        return false;
+      });
+    }
+
+    let importedCount = 0;
+    for (let index = 0; index < candidates.length; index += RSVP_IMPORT_CHUNK_SIZE) {
+      const chunk = candidates.slice(index, index + RSVP_IMPORT_CHUNK_SIZE);
+      const insertResult = await client.query(
+        `INSERT INTO pre_event_rsvps
+         (pre_event_id, full_name, email_address, status, registration_type, registration_source)
+         SELECT $1, imported.full_name, imported.email_address, 'pre_registered', 'rsvp', 'import'
+         FROM UNNEST($2::text[], $3::text[]) AS imported(full_name, email_address)
+         ON CONFLICT (pre_event_id, email_address) DO NOTHING
+         RETURNING email_address`,
+        [
+          req.params.id,
+          chunk.map(row => row.fullName),
+          chunk.map(row => row.emailAddress)
+        ]
+      );
+
+      const insertedEmails = new Set(insertResult.rows.map(row => normalizeEmail(row.email_address)));
+      importedCount += insertedEmails.size;
+      chunk.forEach((row) => {
+        if (insertedEmails.has(row.emailAddress)) return;
+        duplicateCount += 1;
+        errors.push({
+          sourceRow: row.sourceRow,
+          emailAddress: row.emailAddress,
+          type: 'duplicate',
+          reason: 'This email was registered while the import was running.'
+        });
+      });
+    }
+
+    await client.query('COMMIT');
+    transactionStarted = false;
+
+    return res.status(201).json({
+      success: true,
+      summary: {
+        received: validation.received,
+        imported: importedCount,
+        invalid: validation.invalidCount,
+        duplicates: duplicateCount
+      },
+      errors
+    });
+  } catch (error) {
+    if (transactionStarted) await client.query('ROLLBACK');
+    console.error('Pre-event RSVP import error:', error);
+    return res.status(500).json({ error: 'Unable to import attendees. No rows were added.' });
+  } finally {
+    client.release();
+  }
+};
+
+exports.sendImportedRsvpQrBatch = async (req, res) => {
+  try {
+    const preEvent = await getOwnedPreEventRow(req.churchId, req.params.id);
+    if (!preEvent) {
+      return res.status(404).json({ error: 'Pre-event not found.' });
+    }
+
+    const reservation = await reserveImportedQrEmailBatch({
+      churchId: req.churchId,
+      preEventId: preEvent.id,
+      maxCount: QR_EMAIL_BATCH_LIMIT
+    });
+    const selectedRsvps = reservation.reservations;
+
+    if (selectedRsvps.length === 0) {
+      return res.json({
+        success: true,
+        summary: {
+          selected: 0,
+          sent: 0,
+          failed: 0,
+          remainingUnsent: await countRemainingImportedQrEmails(preEvent.id)
+        },
+        errors: [],
+        quota: reservation.quota
+      });
+    }
+
+    const preparationResults = await mapWithConcurrency(
+      selectedRsvps,
+      QR_EMAIL_PREPARATION_CONCURRENCY,
+      rsvp => prepareImportedQrEmail(preEvent, rsvp)
+    );
+    const preparedEmails = preparationResults.filter(result => result.prepared);
+    const failures = preparationResults
+      .filter(result => !result.prepared)
+      .map(result => ({
+        reservationId: result.reservationId,
+        rsvpId: result.rsvpId,
+        emailAddress: result.emailAddress,
+        reason: result.reason || 'QR image preparation failed.'
+      }));
+
+    if (preparedEmails.length === 0) {
+      const quota = await completeQrEmailBatch({
+        churchId: req.churchId,
+        failures
+      });
+      return res.json({
+        success: true,
+        summary: {
+          selected: selectedRsvps.length,
+          sent: 0,
+          failed: failures.length,
+          remainingUnsent: await countRemainingImportedQrEmails(preEvent.id)
+        },
+        errors: failures.map(({ rsvpId, emailAddress, reason }) => ({ rsvpId, emailAddress, reason })),
+        quota
+      });
+    }
+
+    const idempotencyHash = crypto
+      .createHash('sha256')
+      .update(preparedEmails.map(item => item.reservationId).join(','))
+      .digest('hex')
+      .slice(0, 48);
+    let batchResult;
+    try {
+      batchResult = await sendRsvpQrEmailBatch({
+        emails: preparedEmails.map(item => item.email),
+        idempotencyKey: `rsvp-qr-${preEvent.id}-${idempotencyHash}`
+      });
+    } catch (providerError) {
+      batchResult = {
+        sent: false,
+        accepted: [],
+        errors: [],
+        reason: providerError.message || 'The email provider rejected the QR email batch.'
+      };
+    }
+
+    if (!batchResult.sent) {
+      const providerFailures = preparedEmails.map(item => ({
+        reservationId: item.reservationId,
+        rsvpId: item.rsvpId,
+        emailAddress: item.emailAddress,
+        reason: batchResult.reason || 'The email provider rejected the QR email batch.'
+      }));
+      const allFailures = [...failures, ...providerFailures];
+      const quota = await completeQrEmailBatch({
+        churchId: req.churchId,
+        failures: allFailures
+      });
+      await cleanupPreparedQrAssets(preparedEmails);
+
+      return res.status(502).json({
+        error: batchResult.reason || 'The email provider rejected the QR email batch.',
+        summary: {
+          selected: selectedRsvps.length,
+          sent: 0,
+          failed: allFailures.length,
+          remainingUnsent: await countRemainingImportedQrEmails(preEvent.id)
+        },
+        errors: allFailures.map(({ rsvpId, emailAddress, reason }) => ({ rsvpId, emailAddress, reason })),
+        quota
+      });
+    }
+
+    const providerErrorByIndex = new Map(
+      batchResult.errors
+        .filter(error => Number.isInteger(Number(error.index)))
+        .map(error => [Number(error.index), error.message || 'The email provider rejected this recipient.'])
+    );
+    const successes = [];
+    const providerRejectedItems = [];
+    let acceptedIndex = 0;
+
+    preparedEmails.forEach((item, index) => {
+      const providerError = providerErrorByIndex.get(index);
+      if (providerError) {
+        failures.push({
+          reservationId: item.reservationId,
+          rsvpId: item.rsvpId,
+          emailAddress: item.emailAddress,
+          reason: providerError
+        });
+        providerRejectedItems.push(item);
+        return;
+      }
+
+      if (!batchResult.accepted[acceptedIndex]) {
+        failures.push({
+          reservationId: item.reservationId,
+          rsvpId: item.rsvpId,
+          emailAddress: item.emailAddress,
+          reason: 'The email provider did not confirm this recipient.'
+        });
+        providerRejectedItems.push(item);
+        return;
+      }
+
+      acceptedIndex += 1;
+      successes.push({
+        reservationId: item.reservationId,
+        rsvpId: item.rsvpId,
+        tokenHash: item.tokenHash
+      });
+    });
+
+    const quota = await completeQrEmailBatch({
+      churchId: req.churchId,
+      successes,
+      failures
+    });
+    await cleanupPreparedQrAssets(providerRejectedItems);
+
+    return res.json({
+      success: true,
+      summary: {
+        selected: selectedRsvps.length,
+        sent: successes.length,
+        failed: failures.length,
+        remainingUnsent: await countRemainingImportedQrEmails(preEvent.id)
+      },
+      errors: failures.map(({ rsvpId, emailAddress, reason }) => ({ rsvpId, emailAddress, reason })),
+      quota
+    });
+  } catch (error) {
+    console.error('Send imported RSVP QR batch error:', error);
+    return res.status(error.statusCode || 500).json({
+      error: error.statusCode ? error.message : 'Unable to send imported RSVP QR emails.',
+      code: error.code || null,
+      quota: error.quota || null
+    });
   }
 };
 
@@ -799,7 +1200,7 @@ exports.submitPublicRsvp = async (req, res) => {
       preEvent.virtual_attendance_enabled === true
     );
 
-    let rsvp = await insertPreEventRsvp(preEvent, payload);
+    let rsvp = await insertPreEventRsvp(preEvent, payload, 'public');
     const emailToken = generateRsvpCheckinToken();
     let qrEmail = { sent: false };
     try {
@@ -815,6 +1216,7 @@ exports.submitPublicRsvp = async (req, res) => {
       success: true,
       message: 'Your access is secured. See you there!',
       qrEmailSent: Boolean(qrEmail.sent),
+      emailWarning: !qrEmail.sent ? (qrEmail.reason || 'Your QR email could not be sent yet.') : null,
       rsvp: mapRsvp(rsvp)
     });
   } catch (error) {
@@ -846,7 +1248,7 @@ exports.createManualRsvp = async (req, res) => {
       preEvent.virtual_attendance_enabled === true
     );
 
-    let rsvp = await insertPreEventRsvp(preEvent, payload);
+    let rsvp = await insertPreEventRsvp(preEvent, payload, 'manual');
     let qrEmail = { sent: false };
     const shouldSendQrEmail = req.body.sendQrEmail !== false;
 
@@ -868,6 +1270,8 @@ exports.createManualRsvp = async (req, res) => {
         : 'RSVP added successfully.',
       qrEmailSent: Boolean(qrEmail.sent),
       emailWarning: shouldSendQrEmail && !qrEmail.sent ? (qrEmail.reason || 'QR email was not sent.') : null,
+      quota: qrEmail.quota || null,
+      qrEmailQuota: qrEmail.quota || null,
       rsvp: mapRsvp(rsvp)
     });
   } catch (error) {
@@ -910,17 +1314,25 @@ exports.resendRsvpQrEmail = async (req, res) => {
 
     const emailResult = await sendCheckinQrForRsvp({ preEvent, rsvp });
     if (!emailResult.sent) {
-      return res.status(500).json({ error: emailResult.reason || 'Failed to send RSVP QR email.' });
+      return res.status(500).json({
+        error: emailResult.reason || 'Failed to send RSVP QR email.',
+        quota: emailResult.quota || null
+      });
     }
 
     const refreshed = await pool.query('SELECT * FROM pre_event_rsvps WHERE id = $1', [rsvp.id]);
     return res.json({
       success: true,
       message: 'RSVP QR email resent.',
-      rsvp: mapRsvp(refreshed.rows[0])
+      rsvp: mapRsvp(refreshed.rows[0]),
+      quota: emailResult.quota || null
     });
   } catch (error) {
     console.error('Resend RSVP QR email error:', error);
-    return res.status(500).json({ error: 'Server error resending RSVP QR email.' });
+    return res.status(error.statusCode || 500).json({
+      error: error.statusCode ? error.message : 'Server error resending RSVP QR email.',
+      code: error.code || null,
+      quota: error.quota || null
+    });
   }
 };

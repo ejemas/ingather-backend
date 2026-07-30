@@ -40,12 +40,36 @@ router.post(
 
 router.post('/', auth, preEventValidators, validate, preEventController.createPreEvent);
 router.get('/', auth, preEventController.getPreEvents);
+router.get('/qr-email-quota', auth, preEventController.getQrEmailQuota);
 
 router.get(
   '/:id',
   auth,
   [param('id').isInt().withMessage('Invalid pre-event ID'), validate],
   preEventController.getPreEventById
+);
+
+router.post(
+  '/:id/rsvps/import',
+  auth,
+  [
+    param('id').isInt().withMessage('Invalid pre-event ID'),
+    body('rows')
+      .isArray({ min: 1, max: 5000 })
+      .withMessage('Import between 1 and 5,000 attendee rows'),
+    validate
+  ],
+  preEventController.importPreEventRsvps
+);
+
+router.post(
+  '/:id/rsvps/send-imported-qr-batch',
+  auth,
+  [
+    param('id').isInt().withMessage('Invalid pre-event ID'),
+    validate
+  ],
+  preEventController.sendImportedRsvpQrBatch
 );
 
 router.post(

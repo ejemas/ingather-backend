@@ -127,11 +127,7 @@ const sendWaitlistInviteEmail = async ({ email, firstName, inviteLink }) => {
   return { sent: true };
 };
 
-const sendRsvpQrEmail = async ({ email, attendeeName, eventTitle, eventDate, organizerName, qrImageUrl, checkinLink, checkinToken }) => {
-  if (!resend) {
-    return { sent: false, reason: 'RESEND_API_KEY is not configured' };
-  }
-
+const buildRsvpQrEmailPayload = ({ email, attendeeName, eventTitle, eventDate, organizerName, qrImageUrl, checkinLink, checkinToken }) => {
   const safeName = attendeeName || 'there';
   const safeOrganizer = organizerName || 'your event organizer';
   const eventDateLabel = eventDate
@@ -145,7 +141,7 @@ const sendRsvpQrEmail = async ({ email, attendeeName, eventTitle, eventDate, org
       })
     : 'Event date';
 
-  const { error } = await resend.emails.send({
+  return {
     from: `Ingather <${process.env.EMAIL_FROM || 'no-reply@ingather.app'}>`,
     to: email,
     subject: `Your check-in QR for ${eventTitle}`,
@@ -186,8 +182,15 @@ const sendRsvpQrEmail = async ({ email, attendeeName, eventTitle, eventDate, org
         </div>
       </div>
     `
-  });
+  };
+};
 
+const sendRsvpQrEmail = async (email) => {
+  if (!resend) {
+    return { sent: false, reason: 'RESEND_API_KEY is not configured' };
+  }
+
+  const { error } = await resend.emails.send(buildRsvpQrEmailPayload(email));
   if (error) {
     console.error('RSVP QR email error:', error);
     return { sent: false, reason: error.message || 'Failed to send RSVP QR email' };
@@ -196,4 +199,45 @@ const sendRsvpQrEmail = async ({ email, attendeeName, eventTitle, eventDate, org
   return { sent: true };
 };
 
-module.exports = { generateOTP, sendOTPEmail, sendPasswordResetEmail, sendWaitlistInviteEmail, sendRsvpQrEmail };
+const sendRsvpQrEmailBatch = async ({ emails, idempotencyKey }) => {
+  if (!resend) {
+    return { sent: false, reason: 'RESEND_API_KEY is not configured', accepted: [], errors: [] };
+  }
+  if (!Array.isArray(emails) || emails.length === 0) {
+    return { sent: true, accepted: [], errors: [] };
+  }
+
+  const { data, error } = await resend.batch.send(
+    emails.map(buildRsvpQrEmailPayload),
+    {
+      batchValidation: 'permissive',
+      idempotencyKey
+    }
+  );
+
+  if (error) {
+    console.error('RSVP QR batch email error:', error);
+    return {
+      sent: false,
+      reason: error.message || 'Failed to send RSVP QR email batch',
+      accepted: [],
+      errors: []
+    };
+  }
+
+  return {
+    sent: true,
+    accepted: Array.isArray(data?.data) ? data.data : [],
+    errors: Array.isArray(data?.errors) ? data.errors : []
+  };
+};
+
+module.exports = {
+  buildRsvpQrEmailPayload,
+  generateOTP,
+  sendOTPEmail,
+  sendPasswordResetEmail,
+  sendRsvpQrEmail,
+  sendRsvpQrEmailBatch,
+  sendWaitlistInviteEmail
+};

@@ -180,6 +180,7 @@ CREATE TABLE IF NOT EXISTS pre_event_rsvps (
     custom_answers JSONB DEFAULT '{}'::jsonb,
     status VARCHAR(30) NOT NULL DEFAULT 'pre_registered',
     registration_type VARCHAR(30) NOT NULL DEFAULT 'rsvp',
+    registration_source VARCHAR(20) NOT NULL DEFAULT 'legacy',
     checked_in_at TIMESTAMP,
     attendance_mode VARCHAR(20),
     checkin_token_hash TEXT,
@@ -189,7 +190,22 @@ CREATE TABLE IF NOT EXISTS pre_event_rsvps (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT pre_event_rsvps_status_check CHECK (status IN ('pre_registered', 'checked_in')),
     CONSTRAINT pre_event_rsvps_registration_type_check CHECK (registration_type IN ('rsvp')),
+    CONSTRAINT pre_event_rsvps_registration_source_check CHECK (registration_source IN ('public', 'manual', 'import', 'legacy')),
     CONSTRAINT pre_event_rsvps_attendance_mode_check CHECK (attendance_mode IS NULL OR attendance_mode IN ('physical', 'virtual'))
+);
+
+CREATE TABLE IF NOT EXISTS rsvp_qr_email_sends (
+    id BIGSERIAL PRIMARY KEY,
+    church_id INTEGER NOT NULL REFERENCES churches(id) ON DELETE CASCADE,
+    pre_event_id INTEGER NOT NULL REFERENCES pre_events(id) ON DELETE CASCADE,
+    rsvp_id INTEGER REFERENCES pre_event_rsvps(id) ON DELETE SET NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'reserved',
+    failure_reason TEXT,
+    reserved_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    sent_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT rsvp_qr_email_sends_status_check CHECK (status IN ('reserved', 'sent', 'failed'))
 );
 
 ALTER TABLE pre_events ENABLE ROW LEVEL SECURITY;
@@ -198,6 +214,10 @@ ALTER TABLE pre_event_rsvps ENABLE ROW LEVEL SECURITY;
 ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checkin_token_hash TEXT;
 ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checkin_qr_sent_at TIMESTAMPTZ;
 ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS checkin_qr_last_sent_at TIMESTAMPTZ;
+ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS registration_source VARCHAR(20) NOT NULL DEFAULT 'legacy';
+ALTER TABLE pre_event_rsvps DROP CONSTRAINT IF EXISTS pre_event_rsvps_registration_source_check;
+ALTER TABLE pre_event_rsvps ADD CONSTRAINT pre_event_rsvps_registration_source_check
+  CHECK (registration_source IN ('public', 'manual', 'import', 'legacy'));
 ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS virtual_attendance_enabled BOOLEAN DEFAULT FALSE;
 ALTER TABLE pre_event_rsvps ADD COLUMN IF NOT EXISTS attendance_mode VARCHAR(20);
 ALTER TABLE attendees ADD COLUMN IF NOT EXISTS attendance_mode VARCHAR(20) DEFAULT 'physical';
@@ -348,3 +368,8 @@ CREATE INDEX IF NOT EXISTS idx_pre_events_church_date ON pre_events(church_id, e
 CREATE INDEX IF NOT EXISTS idx_pre_events_discover_date ON pre_events(discover_enabled, is_rsvp_active, event_date ASC);
 CREATE INDEX IF NOT EXISTS idx_pre_events_slug ON pre_events(slug);
 CREATE INDEX IF NOT EXISTS idx_pre_event_rsvps_event_time ON pre_event_rsvps(pre_event_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_rsvp_qr_email_sends_church_time
+    ON rsvp_qr_email_sends(church_id, status, reserved_at DESC, sent_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rsvp_qr_email_sends_active_rsvp
+    ON rsvp_qr_email_sends(rsvp_id)
+    WHERE status = 'reserved' AND rsvp_id IS NOT NULL;
