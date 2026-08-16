@@ -1,14 +1,122 @@
-const { Resend } = require('resend');
 const crypto = require('crypto');
 
-let resend = null;
+const MAILERSEND_EMAIL_ENDPOINT = 'https://api.mailersend.com/v1/email';
+const MAILERSEND_REQUEST_TIMEOUT_MS = 15_000;
+const RSVP_QR_BATCH_CONCURRENCY = 5;
 
-if (process.env.RESEND_API_KEY) {
-  resend = new Resend(process.env.RESEND_API_KEY);
-  console.log('✅ Email service ready (Resend HTTP API)');
+const getMailerSendToken = () => process.env.MAILERSEND_API_TOKEN;
+
+if (getMailerSendToken()) {
+  console.log('Email service ready (MailerSend HTTP API)');
 } else {
-  console.warn('⚠️ RESEND_API_KEY not set — email sending will fail. Add it to your environment variables.');
+  console.warn('MAILERSEND_API_TOKEN not set - email sending will fail. Add it to your backend environment variables.');
 }
+
+const getEmailSender = () => ({
+  email: process.env.EMAIL_FROM || 'no-reply@ingather.app',
+  name: 'Ingather'
+});
+
+const getProviderErrorMessage = (body, fallback) => {
+  if (body && typeof body === 'object') {
+    if (typeof body.message === 'string' && body.message.trim()) return body.message;
+    if (body.errors && typeof body.errors === 'object') {
+      const firstError = Object.values(body.errors).flat().find(Boolean);
+      if (typeof firstError === 'string') return firstError;
+    }
+  }
+
+  return fallback;
+};
+
+const parseResponseBody = async (response) => {
+  const text = await response.text();
+  if (!text) return null;
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+};
+
+const sendMailerSendEmail = async ({ to, subject, html }) => {
+  const token = getMailerSendToken();
+  if (!token) {
+    return { sent: false, reason: 'MAILERSEND_API_TOKEN is not configured' };
+  }
+
+  if (typeof fetch !== 'function') {
+    return { sent: false, reason: 'This server runtime does not support the MailerSend HTTP client.' };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), MAILERSEND_REQUEST_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(MAILERSEND_EMAIL_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        from: getEmailSender(),
+        to: [{ email: to }],
+        subject,
+        html
+      }),
+      signal: controller.signal
+    });
+    const body = await parseResponseBody(response);
+    const messageId = response.headers.get('x-message-id');
+    const sendPaused = response.headers.get('x-send-paused') === 'true';
+    const warnings = Array.isArray(body?.warnings) ? body.warnings : [];
+
+    if (response.status !== 202) {
+      return {
+        sent: false,
+        reason: getProviderErrorMessage(body, `MailerSend rejected the email request (${response.status}).`)
+      };
+    }
+
+    if (sendPaused) {
+      return { sent: false, reason: 'MailerSend accepted the request but email sending is paused.' };
+    }
+
+    if (warnings.length > 0 || !messageId) {
+      return {
+        sent: false,
+        reason: getProviderErrorMessage(body, 'MailerSend did not accept this recipient for delivery.')
+      };
+    }
+
+    return { sent: true, id: messageId };
+  } catch (error) {
+    const reason = error?.name === 'AbortError'
+      ? 'MailerSend email request timed out.'
+      : error?.message || 'MailerSend email request failed.';
+    return { sent: false, reason };
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const mapWithConcurrency = async (items, concurrency, mapper) => {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  const worker = async () => {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+    }
+  };
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+  return results;
+};
 
 const generateOTP = () => {
   return crypto.randomInt(100000, 1000000).toString();
@@ -18,8 +126,7 @@ const generateOTP = () => {
  * Send OTP email for account verification
  */
 const sendOTPEmail = async (email, otp) => {
-  const { error } = await resend.emails.send({
-    from: `Ingather <${process.env.EMAIL_FROM || 'no-reply@ingather.app'}>`,
+  const result = await sendMailerSendEmail({
     to: email,
     subject: 'Verify Your Ingather Account',
     html: `
@@ -46,18 +153,19 @@ const sendOTPEmail = async (email, otp) => {
     `
   });
 
-  if (error) {
-    console.error('Email send error:', error);
-    throw new Error(error.message || 'Failed to send email');
+  if (!result.sent) {
+    console.error('Email send error:', result.reason);
+    throw new Error(result.reason || 'Failed to send email');
   }
+
+  return result;
 };
 
 /**
  * Send OTP email for password reset
  */
 const sendPasswordResetEmail = async (email, otp) => {
-  const { error } = await resend.emails.send({
-    from: `Ingather <${process.env.EMAIL_FROM || 'no-reply@ingather.app'}>`,
+  const result = await sendMailerSendEmail({
     to: email,
     subject: 'Reset Your Ingather Password',
     html: `
@@ -84,19 +192,16 @@ const sendPasswordResetEmail = async (email, otp) => {
     `
   });
 
-  if (error) {
-    console.error('Email send error:', error);
-    throw new Error(error.message || 'Failed to send email');
+  if (!result.sent) {
+    console.error('Email send error:', result.reason);
+    throw new Error(result.reason || 'Failed to send email');
   }
+
+  return result;
 };
 
 const sendWaitlistInviteEmail = async ({ email, firstName, inviteLink }) => {
-  if (!resend) {
-    return { sent: false, reason: 'RESEND_API_KEY is not configured' };
-  }
-
-  const { error } = await resend.emails.send({
-    from: `Ingather <${process.env.EMAIL_FROM || 'no-reply@ingather.app'}>`,
+  const result = await sendMailerSendEmail({
     to: email,
     subject: 'Your Ingather invite is ready',
     html: `
@@ -119,12 +224,12 @@ const sendWaitlistInviteEmail = async ({ email, firstName, inviteLink }) => {
     `
   });
 
-  if (error) {
-    console.error('Waitlist invite email error:', error);
-    return { sent: false, reason: error.message || 'Failed to send invite email' };
+  if (!result.sent) {
+    console.error('Waitlist invite email error:', result.reason);
+    return { sent: false, reason: result.reason || 'Failed to send invite email' };
   }
 
-  return { sent: true };
+  return result;
 };
 
 const buildRsvpQrEmailPayload = ({ email, attendeeName, eventTitle, eventDate, organizerName, qrImageUrl, checkinLink, checkinToken }) => {
@@ -142,7 +247,6 @@ const buildRsvpQrEmailPayload = ({ email, attendeeName, eventTitle, eventDate, o
     : 'Event date';
 
   return {
-    from: `Ingather <${process.env.EMAIL_FROM || 'no-reply@ingather.app'}>`,
     to: email,
     subject: `Your check-in QR for ${eventTitle}`,
     html: `
@@ -186,55 +290,58 @@ const buildRsvpQrEmailPayload = ({ email, attendeeName, eventTitle, eventDate, o
 };
 
 const sendRsvpQrEmail = async (email) => {
-  if (!resend) {
-    return { sent: false, reason: 'RESEND_API_KEY is not configured' };
+  const result = await sendMailerSendEmail(buildRsvpQrEmailPayload(email));
+  if (!result.sent) {
+    console.error('RSVP QR email error:', result.reason);
+    return { sent: false, reason: result.reason || 'Failed to send RSVP QR email' };
   }
 
-  const { error } = await resend.emails.send(buildRsvpQrEmailPayload(email));
-  if (error) {
-    console.error('RSVP QR email error:', error);
-    return { sent: false, reason: error.message || 'Failed to send RSVP QR email' };
-  }
-
-  return { sent: true };
+  return result;
 };
 
-const sendRsvpQrEmailBatch = async ({ emails, idempotencyKey }) => {
-  if (!resend) {
-    return { sent: false, reason: 'RESEND_API_KEY is not configured', accepted: [], errors: [] };
-  }
+const sendRsvpQrEmailBatch = async ({ emails }) => {
   if (!Array.isArray(emails) || emails.length === 0) {
     return { sent: true, accepted: [], errors: [] };
   }
 
-  const { data, error } = await resend.batch.send(
-    emails.map(buildRsvpQrEmailPayload),
-    {
-      batchValidation: 'permissive',
-      idempotencyKey
-    }
+  const results = await mapWithConcurrency(
+    emails,
+    RSVP_QR_BATCH_CONCURRENCY,
+    email => sendMailerSendEmail(buildRsvpQrEmailPayload(email))
   );
+  const accepted = [];
+  const errors = [];
 
-  if (error) {
-    console.error('RSVP QR batch email error:', error);
+  results.forEach((result, index) => {
+    if (result.sent) {
+      accepted.push({ id: result.id });
+      return;
+    }
+
+    errors.push({ index, message: result.reason || 'Failed to send RSVP QR email.' });
+  });
+
+  if (accepted.length === 0) {
+    console.error('RSVP QR batch email error:', errors[0]?.message || 'MailerSend rejected the QR email batch.');
     return {
       sent: false,
-      reason: error.message || 'Failed to send RSVP QR email batch',
+      reason: errors[0]?.message || 'Failed to send RSVP QR email batch',
       accepted: [],
-      errors: []
+      errors
     };
   }
 
   return {
     sent: true,
-    accepted: Array.isArray(data?.data) ? data.data : [],
-    errors: Array.isArray(data?.errors) ? data.errors : []
+    accepted,
+    errors
   };
 };
 
 module.exports = {
   buildRsvpQrEmailPayload,
   generateOTP,
+  sendMailerSendEmail,
   sendOTPEmail,
   sendPasswordResetEmail,
   sendRsvpQrEmail,
