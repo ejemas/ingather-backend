@@ -1,7 +1,7 @@
 const pool = require('../config/database');
 
-const QR_EMAIL_DAILY_LIMIT = 100;
-const QR_EMAIL_BATCH_LIMIT = 100;
+const QR_EMAIL_DAILY_LIMIT = 500;
+const QR_EMAIL_BATCH_LIMIT = 500;
 const QR_EMAIL_TIMEZONE = 'Africa/Lagos';
 const QR_RESERVATION_TTL_MINUTES = 15;
 const QR_QUOTA_LOCK_NAMESPACE = 731409;
