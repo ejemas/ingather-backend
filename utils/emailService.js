@@ -330,7 +330,7 @@ const buildRsvpQrEmailPayload = ({ email, attendeeName, eventTitle, eventDate, o
             <p style="margin:0; color:rgba(255,255,255,.62); font-size:13px;">Event</p>
             <strong style="display:block; margin-top:4px;">${eventTitle}</strong>
             <p style="margin:10px 0 0; color:rgba(255,255,255,.82);">${eventDateLabel}</p>
-            ${venueName ? `<p style="margin:8px 0 0; color:rgba(255,255,255,.72); font-size:13px;">📍 ${venueName}${city ? `, ${city}` : ''}</p>` : ''}
+            ${venueName ? `<p style="margin:8px 0 0; color:rgba(255,255,255,.72); font-size:13px;"> ${venueName}${city ? `, ${city}` : ''}</p>` : ''}
           </div>
           <p style="color: rgba(255,255,255,.56); font-size: 13px; line-height: 1.55; margin: 0;">
             If the QR image does not display, show this secure fallback link at check-in:<br />
