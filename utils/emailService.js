@@ -1,7 +1,9 @@
 const crypto = require('crypto');
 
 const MAILERSEND_EMAIL_ENDPOINT = 'https://api.mailersend.com/v1/email';
+const MAILERSEND_BULK_EMAIL_ENDPOINT = 'https://api.mailersend.com/v1/bulk-email';
 const MAILERSEND_REQUEST_TIMEOUT_MS = 15_000;
+const MAILERSEND_BULK_TIMEOUT_MS = 30_000;
 const RSVP_QR_BATCH_CONCURRENCY = 5;
 
 const getMailerSendToken = () => process.env.MAILERSEND_API_TOKEN;
@@ -96,6 +98,56 @@ const sendMailerSendEmail = async ({ to, subject, html }) => {
     const reason = error?.name === 'AbortError'
       ? 'MailerSend email request timed out.'
       : error?.message || 'MailerSend email request failed.';
+    return { sent: false, reason };
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const sendMailerSendBulkEmails = async (emailPayloads) => {
+  const token = getMailerSendToken();
+  if (!token) {
+    return { sent: false, reason: 'MAILERSEND_API_TOKEN is not configured' };
+  }
+
+  if (typeof fetch !== 'function') {
+    return { sent: false, reason: 'This server runtime does not support the MailerSend HTTP client.' };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), MAILERSEND_BULK_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(MAILERSEND_BULK_EMAIL_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(
+        emailPayloads.map(payload => ({
+          from: getEmailSender(),
+          to: [{ email: payload.to }],
+          subject: payload.subject,
+          html: payload.html
+        }))
+      ),
+      signal: controller.signal
+    });
+    const body = await parseResponseBody(response);
+
+    if (response.status !== 202) {
+      return {
+        sent: false,
+        reason: getProviderErrorMessage(body, `MailerSend rejected the bulk email request (${response.status}).`)
+      };
+    }
+
+    return { sent: true, body };
+  } catch (error) {
+    const reason = error?.name === 'AbortError'
+      ? 'MailerSend bulk email request timed out.'
+      : error?.message || 'MailerSend bulk email request failed.';
     return { sent: false, reason };
   } finally {
     clearTimeout(timeout);
@@ -304,22 +356,26 @@ const sendRsvpQrEmailBatch = async ({ emails }) => {
     return { sent: true, accepted: [], errors: [] };
   }
 
-  const results = await mapWithConcurrency(
-    emails,
-    RSVP_QR_BATCH_CONCURRENCY,
-    email => sendMailerSendEmail(buildRsvpQrEmailPayload(email))
-  );
   const accepted = [];
   const errors = [];
 
-  results.forEach((result, index) => {
+  // MailerSend allows up to 500 emails per bulk request for paid accounts
+  const BATCH_SIZE = 500;
+  
+  for (let i = 0; i < emails.length; i += BATCH_SIZE) {
+    const chunk = emails.slice(i, i + BATCH_SIZE);
+    const payloads = chunk.map(email => buildRsvpQrEmailPayload(email));
+    
+    const result = await sendMailerSendBulkEmails(payloads);
+    
     if (result.sent) {
-      accepted.push({ id: result.id });
-      return;
+      // In bulk sending, we don't get individual message IDs synchronously,
+      // it returns a bulk_email_id. We'll just mark them all as accepted.
+      chunk.forEach(() => accepted.push({ id: result.body?.bulk_email_id || 'bulk-accepted' }));
+    } else {
+      chunk.forEach((_, idx) => errors.push({ index: i + idx, message: result.reason || 'Failed to send RSVP QR email.' }));
     }
-
-    errors.push({ index, message: result.reason || 'Failed to send RSVP QR email.' });
-  });
+  }
 
   if (accepted.length === 0) {
     console.error('RSVP QR batch email error:', errors[0]?.message || 'MailerSend rejected the QR email batch.');
