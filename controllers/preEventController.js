@@ -261,6 +261,8 @@ const sendCheckinQrForRsvp = async ({ preEvent, rsvp, token }) => {
       eventTitle: preEvent.title,
       eventDate: preEvent.event_date,
       organizerName: preEvent.church_name,
+      venueName: preEvent.venue_name || null,
+      city: preEvent.city || null,
       qrImageUrl,
       checkinLink,
       checkinToken
@@ -333,6 +335,8 @@ const prepareImportedQrEmail = async (preEvent, rsvp) => {
         eventTitle: preEvent.title,
         eventDate: preEvent.event_date,
         organizerName: preEvent.church_name,
+        venueName: preEvent.venue_name || null,
+        city: preEvent.city || null,
         qrImageUrl: uploadedQr.flyerUrl,
         checkinLink,
         checkinToken
