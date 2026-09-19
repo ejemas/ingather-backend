@@ -152,6 +152,7 @@ CREATE TABLE IF NOT EXISTS pre_events (
     rsvp_fields JSONB NOT NULL DEFAULT '{"emailAddress":true}'::jsonb,
     rsvp_field_config JSONB DEFAULT '{}'::jsonb,
     custom_form_schema JSONB DEFAULT '[]'::jsonb,
+    community_links JSONB NOT NULL DEFAULT '[]'::jsonb,
     virtual_attendance_enabled BOOLEAN DEFAULT FALSE,
     slug VARCHAR(160) UNIQUE NOT NULL,
     is_rsvp_active BOOLEAN DEFAULT TRUE,

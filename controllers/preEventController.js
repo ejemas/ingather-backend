@@ -4,6 +4,7 @@ const pool = require('../config/database');
 const { uploadEventFlyer, deleteEventFlyer } = require('../utils/supabaseStorage');
 const { sendRsvpQrEmail, sendRsvpQrEmailBatch } = require('../utils/emailService');
 const { normalizeCustomFieldSchema, validateCustomResponses } = require('../utils/customFields');
+const { normalizeCommunityLinks } = require('../utils/communityLinks');
 const {
   MAX_RSVP_IMPORT_ROWS,
   RSVP_IMPORT_CHUNK_SIZE,
@@ -181,6 +182,7 @@ const mapPreEvent = (row, extras = {}) => ({
   rsvpFields: normalizeRsvpFields(row.rsvp_fields || {}),
   rsvpFieldConfig: normalizeFieldConfig(row.rsvp_field_config || {}),
   customFormSchema: normalizeCustomFieldSchema(row.custom_form_schema || []),
+  communityLinks: normalizeCommunityLinks(row.community_links || []),
   virtualAttendanceEnabled: row.virtual_attendance_enabled === true,
   slug: row.slug,
   publicUrl: getPublicRsvpUrl(row.slug),
@@ -561,6 +563,7 @@ exports.createPreEvent = async (req, res) => {
     const rsvpFields = normalizeRsvpFields(req.body.rsvpFields);
     const rsvpFieldConfig = normalizeFieldConfig(req.body.rsvpFieldConfig || {});
     const customFormSchema = normalizeCustomFieldSchema(req.body.customFormSchema || []);
+    const communityLinks = normalizeCommunityLinks(req.body.communityLinks);
     const virtualAttendanceEnabled = parseBoolean(req.body.virtualAttendanceEnabled, false);
     const isRsvpActive = req.body.isRsvpActive !== false;
     const linkedProgramId = await validateLinkedProgram(req.churchId, req.body.programId);
@@ -586,9 +589,9 @@ exports.createPreEvent = async (req, res) => {
     const result = await pool.query(
       `INSERT INTO pre_events (
         church_id, program_id, title, event_date, description, venue_name, city, discover_enabled,
-        banner_url, banner_storage_path, banner_original_name, rsvp_fields, rsvp_field_config, custom_form_schema, virtual_attendance_enabled, slug, is_rsvp_active
+        banner_url, banner_storage_path, banner_original_name, rsvp_fields, rsvp_field_config, custom_form_schema, community_links, virtual_attendance_enabled, slug, is_rsvp_active
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::jsonb, $14::jsonb, $15, $16, $17)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::jsonb, $14::jsonb, $15::jsonb, $16, $17, $18)
       RETURNING *`,
       [
         req.churchId,
@@ -605,6 +608,7 @@ exports.createPreEvent = async (req, res) => {
         JSON.stringify(rsvpFields),
         JSON.stringify(rsvpFieldConfig),
         JSON.stringify(customFormSchema),
+        JSON.stringify(communityLinks),
         virtualAttendanceEnabled,
         slug,
         isRsvpActive
@@ -619,7 +623,7 @@ exports.createPreEvent = async (req, res) => {
       });
     }
 
-    const isValidationError = /Linked live program/i.test(error.message || '');
+    const isValidationError = /Linked live program|Community link/i.test(error.message || '');
     console.error('Create pre-event error:', error);
     return res.status(isValidationError ? 400 : 500).json({ error: error.message || 'Server error creating pre-event.' });
   }
@@ -1005,6 +1009,11 @@ exports.updatePreEvent = async (req, res) => {
         ? req.body.customFormSchema
         : existing.custom_form_schema || []
     );
+    const communityLinks = normalizeCommunityLinks(
+      Object.prototype.hasOwnProperty.call(req.body, 'communityLinks')
+        ? req.body.communityLinks
+        : existing.community_links || []
+    );
     const virtualAttendanceEnabled = typeof req.body.virtualAttendanceEnabled === 'boolean'
       ? req.body.virtualAttendanceEnabled
       : existing.virtual_attendance_enabled === true;
@@ -1049,10 +1058,11 @@ exports.updatePreEvent = async (req, res) => {
            rsvp_fields = $11::jsonb,
            rsvp_field_config = $12::jsonb,
            custom_form_schema = $13::jsonb,
-           virtual_attendance_enabled = $14,
-           is_rsvp_active = $15,
+           community_links = $14::jsonb,
+           virtual_attendance_enabled = $15,
+           is_rsvp_active = $16,
            updated_at = CURRENT_TIMESTAMP
-       WHERE id = $16 AND church_id = $17
+       WHERE id = $17 AND church_id = $18
        RETURNING *`,
       [
         title,
@@ -1068,6 +1078,7 @@ exports.updatePreEvent = async (req, res) => {
         JSON.stringify(rsvpFields),
         JSON.stringify(rsvpFieldConfig),
         JSON.stringify(customFormSchema),
+        JSON.stringify(communityLinks),
         virtualAttendanceEnabled,
         isRsvpActive,
         existing.id,
@@ -1089,7 +1100,7 @@ exports.updatePreEvent = async (req, res) => {
       });
     }
 
-    const isValidationError = /Linked live program/i.test(error.message || '');
+    const isValidationError = /Linked live program|Community link/i.test(error.message || '');
     console.error('Update pre-event error:', error);
     return res.status(isValidationError ? 400 : 500).json({ error: error.message || 'Server error updating pre-event.' });
   }
@@ -1121,7 +1132,7 @@ exports.getPublicPreEvent = async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT pe.id, pe.title, pe.event_date, pe.description, pe.venue_name, pe.city,
-              pe.banner_url, pe.rsvp_fields, pe.rsvp_field_config, pe.custom_form_schema, pe.slug, pe.is_rsvp_active,
+              pe.banner_url, pe.rsvp_fields, pe.rsvp_field_config, pe.custom_form_schema, pe.community_links, pe.slug, pe.is_rsvp_active,
               pe.discover_enabled, pe.virtual_attendance_enabled, c.church_name, COUNT(per.id) AS rsvp_count
        FROM pre_events pe
        JOIN churches c ON c.id = pe.church_id
@@ -1156,7 +1167,7 @@ exports.getDiscoverPreEvents = async (req, res) => {
 
     const result = await pool.query(
       `SELECT pe.id, pe.title, pe.event_date, pe.description, pe.venue_name, pe.city,
-              pe.banner_url, pe.custom_form_schema, pe.slug, pe.is_rsvp_active, pe.discover_enabled,
+              pe.banner_url, pe.custom_form_schema, pe.community_links, pe.slug, pe.is_rsvp_active, pe.discover_enabled,
               pe.virtual_attendance_enabled, c.church_name, COUNT(per.id) AS rsvp_count
        FROM pre_events pe
        JOIN churches c ON c.id = pe.church_id
