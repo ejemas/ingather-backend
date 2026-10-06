@@ -1,27 +1,39 @@
 const crypto = require('crypto');
 
-const MAILERSEND_EMAIL_ENDPOINT = 'https://api.mailersend.com/v1/email';
-const MAILERSEND_BULK_EMAIL_ENDPOINT = 'https://api.mailersend.com/v1/bulk-email';
-const MAILERSEND_REQUEST_TIMEOUT_MS = 15_000;
-const MAILERSEND_BULK_TIMEOUT_MS = 30_000;
-const RSVP_QR_BATCH_CONCURRENCY = 5;
+const ZEPTOMAIL_EMAIL_ENDPOINT = 'https://cpaas.zoho.com/v1.1/email';
+const ZEPTOMAIL_REQUEST_TIMEOUT_MS = 15_000;
+const ZEPTOMAIL_BATCH_CONCURRENCY = 5;
 
-const getMailerSendToken = () => process.env.MAILERSEND_API_TOKEN;
+const getZeptoMailToken = () => (
+  process.env.ZEPTOMAIL_API_TOKEN ||
+  process.env.ZOHO_CPAAS_API_TOKEN ||
+  process.env.ZOHO_API_KEY ||
+  process.env.MAILERSEND_API_TOKEN
+);
 
-if (getMailerSendToken()) {
-  console.log('Email service ready (MailerSend HTTP API)');
+const getAuthHeaderValue = (token) => {
+  if (!token) return '';
+  const trimmed = token.trim();
+  return trimmed.startsWith('Zoho-enczapikey') ? trimmed : `Zoho-enczapikey ${trimmed}`;
+};
+
+if (getZeptoMailToken()) {
+  console.log('Email service ready (ZeptoMail / Zoho CPaaS HTTP API)');
 } else {
-  console.warn('MAILERSEND_API_TOKEN not set - email sending will fail. Add it to your backend environment variables.');
+  console.warn('ZEPTOMAIL_API_TOKEN not set - email sending will fail. Add it to your backend environment variables.');
 }
 
 const getEmailSender = () => ({
-  email: process.env.EMAIL_FROM || 'no-reply@ingather.app',
+  address: process.env.EMAIL_FROM || 'no-reply@ingather.app',
   name: 'Ingather'
 });
 
 const getProviderErrorMessage = (body, fallback) => {
   if (body && typeof body === 'object') {
     if (typeof body.message === 'string' && body.message.trim()) return body.message;
+    if (typeof body.error === 'string' && body.error.trim()) return body.error;
+    if (body.error && typeof body.error.message === 'string') return body.error.message;
+    if (Array.isArray(body.data) && body.data[0]?.message) return body.data[0].message;
     if (body.errors && typeof body.errors === 'object') {
       const firstError = Object.values(body.errors).flat().find(Boolean);
       if (typeof firstError === 'string') return firstError;
@@ -42,117 +54,66 @@ const parseResponseBody = async (response) => {
   }
 };
 
-const sendMailerSendEmail = async ({ to, subject, html }) => {
-  const token = getMailerSendToken();
+const sendZeptoMailEmail = async ({ to, recipientName, subject, html }) => {
+  const token = getZeptoMailToken();
   if (!token) {
-    return { sent: false, reason: 'MAILERSEND_API_TOKEN is not configured' };
+    return { sent: false, reason: 'ZEPTOMAIL_API_TOKEN is not configured' };
   }
 
   if (typeof fetch !== 'function') {
-    return { sent: false, reason: 'This server runtime does not support the MailerSend HTTP client.' };
+    return { sent: false, reason: 'This server runtime does not support the ZeptoMail HTTP client.' };
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), MAILERSEND_REQUEST_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), ZEPTOMAIL_REQUEST_TIMEOUT_MS);
 
   try {
-    const response = await fetch(MAILERSEND_EMAIL_ENDPOINT, {
+    const response = await fetch(ZEPTOMAIL_EMAIL_ENDPOINT, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: getAuthHeaderValue(token),
+        Accept: 'application/json',
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
         from: getEmailSender(),
-        to: [{ email: to }],
+        to: [
+          {
+            email_address: {
+              address: to,
+              name: recipientName || to.split('@')[0]
+            }
+          }
+        ],
         subject,
-        html
+        htmlbody: html
       }),
       signal: controller.signal
     });
+
     const body = await parseResponseBody(response);
-    const messageId = response.headers.get('x-message-id');
-    const sendPaused = response.headers.get('x-send-paused') === 'true';
-    const warnings = Array.isArray(body?.warnings) ? body.warnings : [];
+    const messageId = body?.data?.[0]?.request_id || response.headers.get('x-request-id');
 
-    if (response.status !== 202) {
+    if (response.status < 200 || response.status >= 300) {
       return {
         sent: false,
-        reason: getProviderErrorMessage(body, `MailerSend rejected the email request (${response.status}).`)
+        reason: getProviderErrorMessage(body, `ZeptoMail rejected the email request (${response.status}).`)
       };
     }
 
-    if (sendPaused) {
-      return { sent: false, reason: 'MailerSend accepted the request but email sending is paused.' };
-    }
-
-    if (warnings.length > 0 || !messageId) {
-      return {
-        sent: false,
-        reason: getProviderErrorMessage(body, 'MailerSend did not accept this recipient for delivery.')
-      };
-    }
-
-    return { sent: true, id: messageId };
+    return { sent: true, id: messageId || 'zeptomail-ok' };
   } catch (error) {
     const reason = error?.name === 'AbortError'
-      ? 'MailerSend email request timed out.'
-      : error?.message || 'MailerSend email request failed.';
+      ? 'ZeptoMail email request timed out.'
+      : error?.message || 'ZeptoMail email request failed.';
     return { sent: false, reason };
   } finally {
     clearTimeout(timeout);
   }
 };
 
-const sendMailerSendBulkEmails = async (emailPayloads) => {
-  const token = getMailerSendToken();
-  if (!token) {
-    return { sent: false, reason: 'MAILERSEND_API_TOKEN is not configured' };
-  }
-
-  if (typeof fetch !== 'function') {
-    return { sent: false, reason: 'This server runtime does not support the MailerSend HTTP client.' };
-  }
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), MAILERSEND_BULK_TIMEOUT_MS);
-
-  try {
-    const response = await fetch(MAILERSEND_BULK_EMAIL_ENDPOINT, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(
-        emailPayloads.map(payload => ({
-          from: getEmailSender(),
-          to: [{ email: payload.to }],
-          subject: payload.subject,
-          html: payload.html
-        }))
-      ),
-      signal: controller.signal
-    });
-    const body = await parseResponseBody(response);
-
-    if (response.status !== 202) {
-      return {
-        sent: false,
-        reason: getProviderErrorMessage(body, `MailerSend rejected the bulk email request (${response.status}).`)
-      };
-    }
-
-    return { sent: true, body };
-  } catch (error) {
-    const reason = error?.name === 'AbortError'
-      ? 'MailerSend bulk email request timed out.'
-      : error?.message || 'MailerSend bulk email request failed.';
-    return { sent: false, reason };
-  } finally {
-    clearTimeout(timeout);
-  }
-};
+// Aliased for backwards compatibility
+const sendMailerSendEmail = sendZeptoMailEmail;
 
 const mapWithConcurrency = async (items, concurrency, mapper) => {
   const results = new Array(items.length);
@@ -178,7 +139,7 @@ const generateOTP = () => {
  * Send OTP email for account verification
  */
 const sendOTPEmail = async (email, otp) => {
-  const result = await sendMailerSendEmail({
+  const result = await sendZeptoMailEmail({
     to: email,
     subject: 'Verify Your Ingather Account',
     html: `
@@ -217,7 +178,7 @@ const sendOTPEmail = async (email, otp) => {
  * Send OTP email for password reset
  */
 const sendPasswordResetEmail = async (email, otp) => {
-  const result = await sendMailerSendEmail({
+  const result = await sendZeptoMailEmail({
     to: email,
     subject: 'Reset Your Ingather Password',
     html: `
@@ -253,8 +214,9 @@ const sendPasswordResetEmail = async (email, otp) => {
 };
 
 const sendWaitlistInviteEmail = async ({ email, firstName, inviteLink }) => {
-  const result = await sendMailerSendEmail({
+  const result = await sendZeptoMailEmail({
     to: email,
+    recipientName: firstName,
     subject: 'Your Ingather invite is ready',
     html: `
       <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 560px; margin: 0 auto; background-color: #090809; border-radius: 18px; overflow: hidden;">
@@ -300,6 +262,7 @@ const buildRsvpQrEmailPayload = ({ email, attendeeName, eventTitle, eventDate, o
 
   return {
     to: email,
+    recipientName: attendeeName,
     subject: `Your check-in QR for ${eventTitle}`,
     html: `
       <div style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 600px; margin: 0 auto; background-color: #090809; border-radius: 20px; overflow: hidden;">
@@ -343,7 +306,7 @@ const buildRsvpQrEmailPayload = ({ email, attendeeName, eventTitle, eventDate, o
 };
 
 const sendRsvpQrEmail = async (email) => {
-  const result = await sendMailerSendEmail(buildRsvpQrEmailPayload(email));
+  const result = await sendZeptoMailEmail(buildRsvpQrEmailPayload(email));
   if (!result.sent) {
     console.error('RSVP QR email error:', result.reason);
     return { sent: false, reason: result.reason || 'Failed to send RSVP QR email' };
@@ -357,29 +320,26 @@ const sendRsvpQrEmailBatch = async ({ emails }) => {
     return { sent: true, accepted: [], errors: [] };
   }
 
+  const results = await mapWithConcurrency(
+    emails,
+    ZEPTOMAIL_BATCH_CONCURRENCY,
+    email => sendZeptoMailEmail(buildRsvpQrEmailPayload(email))
+  );
+
   const accepted = [];
   const errors = [];
 
-  // MailerSend allows up to 500 emails per bulk request for paid accounts
-  const BATCH_SIZE = 500;
-  
-  for (let i = 0; i < emails.length; i += BATCH_SIZE) {
-    const chunk = emails.slice(i, i + BATCH_SIZE);
-    const payloads = chunk.map(email => buildRsvpQrEmailPayload(email));
-    
-    const result = await sendMailerSendBulkEmails(payloads);
-    
+  results.forEach((result, index) => {
     if (result.sent) {
-      // In bulk sending, we don't get individual message IDs synchronously,
-      // it returns a bulk_email_id. We'll just mark them all as accepted.
-      chunk.forEach(() => accepted.push({ id: result.body?.bulk_email_id || 'bulk-accepted' }));
-    } else {
-      chunk.forEach((_, idx) => errors.push({ index: i + idx, message: result.reason || 'Failed to send RSVP QR email.' }));
+      accepted.push({ id: result.id || `accepted-${index}` });
+      return;
     }
-  }
+
+    errors.push({ index, message: result.reason || 'Failed to send RSVP QR email.' });
+  });
 
   if (accepted.length === 0) {
-    console.error('RSVP QR batch email error:', errors[0]?.message || 'MailerSend rejected the QR email batch.');
+    console.error('RSVP QR batch email error:', errors[0]?.message || 'ZeptoMail rejected the QR email batch.');
     return {
       sent: false,
       reason: errors[0]?.message || 'Failed to send RSVP QR email batch',
@@ -398,6 +358,7 @@ const sendRsvpQrEmailBatch = async ({ emails }) => {
 module.exports = {
   buildRsvpQrEmailPayload,
   generateOTP,
+  sendZeptoMailEmail,
   sendMailerSendEmail,
   sendOTPEmail,
   sendPasswordResetEmail,
