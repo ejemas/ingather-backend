@@ -106,11 +106,27 @@ const isValidEmail = (value) => {
 
 const DEFAULT_TEXTAREA_LABEL = 'Additional Response';
 
+// Per-field required flags. A missing flag means required, so older pre-events keep their behavior.
+const normalizeRequiredFields = (value) => {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  return OPTIONAL_RSVP_FIELDS.reduce((requiredFields, field) => {
+    if (field !== 'firstTimer' && typeof source[field] === 'boolean') {
+      requiredFields[field] = source[field];
+    }
+    return requiredFields;
+  }, {});
+};
+
 const normalizeFieldConfig = (config = {}) => ({
   textareaLabel: typeof config.textareaLabel === 'string' && config.textareaLabel.trim()
     ? config.textareaLabel.trim().slice(0, 120)
-    : DEFAULT_TEXTAREA_LABEL
+    : DEFAULT_TEXTAREA_LABEL,
+  requiredFields: normalizeRequiredFields(config.requiredFields)
 });
+
+const isRsvpFieldRequired = (normalizedFields, fieldConfig, field) => (
+  Boolean(normalizedFields[field]) && fieldConfig?.requiredFields?.[field] !== false
+);
 
 const normalizeUrlField = (value) => {
   const raw = typeof value === 'string' ? value.trim() : '';
@@ -403,8 +419,10 @@ const validateLinkedProgram = async (churchId, programId) => {
   return normalizedProgramId;
 };
 
-const validateRsvpPayload = (fields, customFormSchema = [], formData = {}, virtualAttendanceEnabled = false) => {
+const validateRsvpPayload = (fields, customFormSchema = [], formData = {}, virtualAttendanceEnabled = false, fieldConfig = {}) => {
   const normalizedFields = normalizeRsvpFields(fields);
+  const normalizedFieldConfig = normalizeFieldConfig(fieldConfig || {});
+  const isRequired = (field) => isRsvpFieldRequired(normalizedFields, normalizedFieldConfig, field);
   const emailAddress = normalizeEmail(formData.emailAddress || formData.email);
 
   if (!isValidEmail(emailAddress)) {
@@ -437,8 +455,9 @@ const validateRsvpPayload = (fields, customFormSchema = [], formData = {}, virtu
 
   OPTIONAL_RSVP_FIELDS.forEach((field) => {
     if (field === 'link') {
-      const linkUrl = normalizeUrlField(formData.linkUrl || formData.link);
-      if (normalizedFields.link && !linkUrl) {
+      const rawLink = cleanText(formData.linkUrl || formData.link, 2048);
+      const linkUrl = normalizeUrlField(rawLink);
+      if ((isRequired('link') && !linkUrl) || (normalizedFields.link && rawLink && !linkUrl)) {
         throw new Error('Link must be a valid http or https URL.');
       }
       payload.linkUrl = linkUrl || null;
@@ -447,7 +466,7 @@ const validateRsvpPayload = (fields, customFormSchema = [], formData = {}, virtu
 
     if (field === 'textarea') {
       const response = cleanText(formData.textareaResponse, 5000);
-      if (normalizedFields.textarea && !response) {
+      if (isRequired('textarea') && !response) {
         throw new Error('Additional response is required.');
       }
       payload.textareaResponse = response || null;
@@ -461,7 +480,7 @@ const validateRsvpPayload = (fields, customFormSchema = [], formData = {}, virtu
 
     if (field === 'age') {
       const rawAge = String(formData.age ?? '').trim();
-      if (normalizedFields.age && !rawAge) {
+      if (isRequired('age') && !rawAge) {
         throw new Error('Age is required.');
       }
       if (rawAge) {
@@ -476,7 +495,7 @@ const validateRsvpPayload = (fields, customFormSchema = [], formData = {}, virtu
 
     const maxLength = field === 'phoneNumber' ? 50 : field === 'address' ? 1000 : 255;
     const value = cleanText(formData[field], maxLength);
-    if (normalizedFields[field] && !value) {
+    if (isRequired(field) && !value) {
       throw new Error(`${RSVP_FIELD_LABELS[field]} is required.`);
     }
 
@@ -1212,7 +1231,8 @@ exports.submitPublicRsvp = async (req, res) => {
       preEvent.rsvp_fields,
       preEvent.custom_form_schema || [],
       req.body.formData || req.body,
-      preEvent.virtual_attendance_enabled === true
+      preEvent.virtual_attendance_enabled === true,
+      preEvent.rsvp_field_config || {}
     );
 
     let rsvp = await insertPreEventRsvp(preEvent, payload, 'public');
@@ -1260,7 +1280,8 @@ exports.createManualRsvp = async (req, res) => {
       preEvent.rsvp_fields,
       preEvent.custom_form_schema || [],
       req.body.formData || {},
-      preEvent.virtual_attendance_enabled === true
+      preEvent.virtual_attendance_enabled === true,
+      preEvent.rsvp_field_config || {}
     );
 
     let rsvp = await insertPreEventRsvp(preEvent, payload, 'manual');
@@ -1351,3 +1372,6 @@ exports.resendRsvpQrEmail = async (req, res) => {
     });
   }
 };
+
+// Exported for unit tests.
+exports.validateRsvpPayload = validateRsvpPayload;
