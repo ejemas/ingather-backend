@@ -3,6 +3,7 @@ const { body, param } = require('express-validator');
 const preEventController = require('../controllers/preEventController');
 const auth = require('../middleware/auth');
 const validate = require('../middleware/validation');
+const createRateLimiter = require('../middleware/rateLimit');
 
 const router = express.Router();
 
@@ -21,6 +22,20 @@ const preEventValidators = [
 ];
 
 router.get('/discover', preEventController.getDiscoverPreEvents);
+
+// A guest opening their own RSVP pass from their email. Limited per IP so codes can't be guessed.
+const passLimiter = createRateLimiter({
+  windowMs: 10 * 60 * 1000,
+  max: 60,
+  keyGenerator: (req) => `rsvp-pass:ip:${req.ip || req.socket?.remoteAddress || 'unknown'}`,
+  message: 'Too many tries. Please wait a few minutes and open your pass again.'
+});
+router.get(
+  '/pass/:token',
+  passLimiter,
+  [param('token').isLength({ min: 6, max: 200 }).withMessage('This pass link is not valid.'), validate],
+  preEventController.getPublicRsvpPass
+);
 
 router.get(
   '/public/:slug',

@@ -38,7 +38,8 @@ test('public RSVP sends and persists its QR without touching the quota ledger', 
           church_id: 7,
           church_name: 'InGather Test',
           title: 'Builder Summit',
-          event_date: new Date('2026-08-01T09:00:00.000Z'),
+          // A week ahead, so the page is still taking RSVPs whenever the test runs.
+          event_date: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
           is_rsvp_active: true,
           rsvp_fields: { emailAddress: true },
           custom_form_schema: [],
@@ -103,8 +104,16 @@ test('public RSVP sends and persists its QR without touching the quota ledger', 
     }
   };
 
+  // Sending is held until the test lets it go, to prove the guest is answered before the email finishes.
+  let releaseEmail;
+  const emailGate = new Promise((resolve) => { releaseEmail = resolve; });
+  emailService.sendRsvpQrEmail = async () => {
+    await emailGate;
+    return { sent: true, id: 'email-1' };
+  };
+
   try {
-    await preEventController.submitPublicRsvp(
+    const background = preEventController.submitPublicRsvp(
       {
         params: { slug: 'builder-summit' },
         body: { formData: { emailAddress: 'ada@example.com' } }
@@ -112,10 +121,20 @@ test('public RSVP sends and persists its QR without touching the quota ledger', 
       response
     );
 
+    // The guest's answer arrives while the email is still on its way.
+    for (let i = 0; i < 20 && !response.payload; i += 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
     assert.equal(response.statusCode, 201);
-    assert.equal(response.payload.qrEmailSent, true);
+    assert.equal(response.payload.qrEmailQueued, true);
+    assert.equal(response.payload.sentTo, 'ada@example.com');
     assert.equal(response.payload.emailWarning, null);
     assert.equal(response.payload.rsvp.registrationSource, 'public');
+    assert.equal(queries.some(query => query.includes('UPDATE pre_event_rsvps')), false);
+
+    // Then the email goes out and the pass is recorded as sent.
+    releaseEmail();
+    await background;
     assert.equal(released, true);
     assert.equal(queries.some(query => query.includes('rsvp_qr_email_sends')), false);
     assert.equal(queries.some(query => query.includes('pg_advisory_xact_lock')), false);
@@ -126,6 +145,60 @@ test('public RSVP sends and persists its QR without touching the quota ledger', 
     emailService.sendRsvpQrEmail = original.sendRsvpQrEmail;
     storage.uploadEventFlyer = original.uploadEventFlyer;
     storage.deleteEventFlyer = original.deleteEventFlyer;
+    delete require.cache[controllerPath];
+  }
+});
+
+test('a repeat RSVP with the same email gets a clear "already registered" answer', async () => {
+  const pool = require('../config/database');
+  const controllerPath = require.resolve('../controllers/preEventController');
+  const originalQuery = pool.query;
+
+  pool.query = async (sql) => {
+    const statement = String(sql);
+    if (statement.includes('WHERE pe.slug = $1')) {
+      return {
+        rows: [{
+          id: 42,
+          church_id: 7,
+          church_name: 'InGather Test',
+          title: 'Builder Summit',
+          event_date: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+          is_rsvp_active: true,
+          rsvp_fields: { emailAddress: true },
+          custom_form_schema: [],
+          virtual_attendance_enabled: false
+        }]
+      };
+    }
+    if (statement.includes('INSERT INTO pre_event_rsvps')) {
+      const duplicate = new Error('duplicate key value violates unique constraint');
+      duplicate.code = '23505';
+      throw duplicate;
+    }
+    throw new Error(`Unexpected pool query: ${statement}`);
+  };
+
+  delete require.cache[controllerPath];
+  const preEventController = require(controllerPath);
+  const response = {
+    statusCode: 200,
+    payload: null,
+    status(code) { this.statusCode = code; return this; },
+    json(payload) { this.payload = payload; return payload; }
+  };
+
+  try {
+    await preEventController.submitPublicRsvp(
+      { params: { slug: 'builder-summit' }, body: { formData: { emailAddress: 'ada@example.com' } } },
+      response
+    );
+    assert.equal(response.statusCode, 409);
+    assert.equal(response.payload.code, 'ALREADY_REGISTERED');
+    assert.match(response.payload.error, /already RSVP'd with this email/);
+    assert.match(response.payload.error, /spam folder/);
+  } finally {
+    pool.query = originalQuery;
     delete require.cache[controllerPath];
   }
 });

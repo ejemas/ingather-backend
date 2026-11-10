@@ -42,6 +42,12 @@ router.get('/:id/sponsor-analytics', auth, programController.getSponsorAnalytics
 // Create a shareable RSVP scanner link (protected)
 router.get('/:id/rsvp-scanner-link', auth, programController.getRsvpScannerLink);
 
+// Load an event for the Edit Event page (protected)
+router.get('/:id/edit', auth, programController.getProgramForEdit);
+
+// Save changes to an event (protected). Its QR code and links stay the same.
+router.put('/:id', auth, programController.updateProgram);
+
 // Get single program (protected)
 router.get('/:id', auth, programController.getProgramById);
 

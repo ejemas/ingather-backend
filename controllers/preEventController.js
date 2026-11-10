@@ -174,6 +174,39 @@ const parseEventDate = (value) => {
   return date;
 };
 
+// RSVP window. Every page stops taking RSVPs 12 hours after the event starts.
+// An organizer can pick an earlier closing time (rsvp_closes_at), never a later one.
+const RSVP_GRACE_MS = 12 * 60 * 60 * 1000;
+
+const toDate = (value) => {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+};
+
+const getRsvpWindow = (row, now = new Date()) => {
+  const eventDate = toDate(row.event_date);
+  const autoCloseAt = eventDate ? new Date(eventDate.getTime() + RSVP_GRACE_MS) : null;
+  const chosen = toDate(row.rsvp_closes_at);
+  const closesAt = chosen && (!autoCloseAt || chosen < autoCloseAt) ? chosen : autoCloseAt;
+  return {
+    closesAt,
+    autoCloseAt,
+    ended: Boolean(closesAt && now.getTime() >= closesAt.getTime())
+  };
+};
+
+// Reads an optional "RSVPs close on" value. Returns { value } or { error }.
+const parseRsvpClosesAt = (raw, eventDate) => {
+  if (raw === null || raw === undefined || raw === '') return { value: null };
+  const date = toDate(raw);
+  if (!date) return { error: 'Pick a valid date and time for RSVPs to close.' };
+  if (eventDate && date.getTime() > eventDate.getTime() + RSVP_GRACE_MS) {
+    return { error: 'RSVPs can close no later than 12 hours after the event starts.' };
+  }
+  return { value: date };
+};
+
 const normalizeProgramId = (value) => {
   if (value === null || value === undefined || value === '') return null;
   const parsed = Number(value);
@@ -204,8 +237,14 @@ const mapPreEvent = (row, extras = {}) => ({
   publicUrl: getPublicRsvpUrl(row.slug),
   discoverEnabled: row.discover_enabled === true,
   isRsvpActive: row.is_rsvp_active !== false,
+  // rsvpClosesAt: the organizer's own closing time (or null). rsvpEndsAt: when RSVPs actually stop.
+  rsvpClosesAt: row.rsvp_closes_at || null,
+  rsvpEndsAt: getRsvpWindow(row).closesAt,
+  rsvpEnded: getRsvpWindow(row).ended,
   rsvpCount: parseInt(row.rsvp_count || extras.rsvpCount || 0, 10),
   churchName: row.church_name || row.organizer_name || '',
+  // Host logo for the public RSVP page. Only stored image links are shared, never inline image data.
+  hostLogoUrl: /^https:\/\//i.test(String(row.church_logo_url || '')) ? row.church_logo_url : null,
   createdAt: row.created_at,
   updatedAt: row.updated_at
 });
@@ -283,7 +322,8 @@ const sendCheckinQrForRsvp = async ({ preEvent, rsvp, token }) => {
       city: preEvent.city || null,
       qrImageUrl,
       checkinLink,
-      checkinToken
+      checkinToken,
+      bannerUrl: preEvent.banner_url || null
     });
 
     if (!emailResult.sent) {
@@ -357,7 +397,8 @@ const prepareImportedQrEmail = async (preEvent, rsvp) => {
         city: preEvent.city || null,
         qrImageUrl: uploadedQr.flyerUrl,
         checkinLink,
-        checkinToken
+        checkinToken,
+        bannerUrl: preEvent.banner_url || null
       }
     };
   } catch (error) {
@@ -569,6 +610,24 @@ const sendAndRefreshRsvpQr = async (preEvent, rsvp, token) => {
   };
 };
 
+// Banner problems the organizer can fix themselves (wrong file, too big). Anything else is a server issue.
+const BANNER_USER_ERRORS = [
+  [/payload is invalid|valid JPEG, PNG, or WebP|type is not supported/i, 'That banner image could not be read. Use a JPEG, PNG or WebP image.'],
+  [/still too large/i, 'That banner is too large even after compressing. Try a smaller image.']
+];
+
+const describeCreateError = (error) => {
+  const message = error?.message || '';
+  if (/Linked live program/i.test(message)) return { status: 400, field: 'programId', error: message };
+  if (/Community link/i.test(message)) return { status: 400, field: 'communityLinks', error: message };
+  const bannerMatch = BANNER_USER_ERRORS.find(([pattern]) => pattern.test(message));
+  if (bannerMatch) return { status: 400, field: 'banner', error: bannerMatch[1] };
+  if (/flyer upload failed|storage is not configured/i.test(message)) {
+    return { status: 502, field: 'banner', error: 'We could not upload the banner right now. Please try again in a moment.' };
+  }
+  return { status: 500, error: 'We could not create the page. Please try again.' };
+};
+
 exports.createPreEvent = async (req, res) => {
   let uploadedBanner = null;
 
@@ -588,11 +647,23 @@ exports.createPreEvent = async (req, res) => {
     const linkedProgramId = await validateLinkedProgram(req.churchId, req.body.programId);
 
     if (!title) {
-      return res.status(400).json({ error: 'Event name is required.' });
+      return res.status(400).json({ error: 'Event name is required.', field: 'title' });
     }
 
     if (!eventDate) {
-      return res.status(400).json({ error: 'A valid event date and time is required.' });
+      return res.status(400).json({ error: 'A valid event date and time is required.', field: 'eventDate' });
+    }
+
+    if (discoverEnabled && !city) {
+      return res.status(400).json({ error: 'Add a city to show this page on Discover.', field: 'city' });
+    }
+
+    const closing = parseRsvpClosesAt(req.body.rsvpClosesAt, eventDate);
+    if (closing.error) {
+      return res.status(400).json({ error: closing.error, field: 'rsvpClosesAt' });
+    }
+    if (closing.value && closing.value.getTime() <= Date.now()) {
+      return res.status(400).json({ error: 'That closing time has already passed. Pick a time in the future.', field: 'rsvpClosesAt' });
     }
 
     if (req.body.banner?.dataUrl) {
@@ -608,9 +679,10 @@ exports.createPreEvent = async (req, res) => {
     const result = await pool.query(
       `INSERT INTO pre_events (
         church_id, program_id, title, event_date, description, venue_name, city, discover_enabled,
-        banner_url, banner_storage_path, banner_original_name, rsvp_fields, rsvp_field_config, custom_form_schema, community_links, virtual_attendance_enabled, slug, is_rsvp_active
+        banner_url, banner_storage_path, banner_original_name, rsvp_fields, rsvp_field_config, custom_form_schema, community_links, virtual_attendance_enabled, slug, is_rsvp_active,
+        rsvp_closes_at
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::jsonb, $14::jsonb, $15::jsonb, $16, $17, $18)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::jsonb, $14::jsonb, $15::jsonb, $16, $17, $18, $19)
       RETURNING *`,
       [
         req.churchId,
@@ -630,7 +702,8 @@ exports.createPreEvent = async (req, res) => {
         JSON.stringify(communityLinks),
         virtualAttendanceEnabled,
         slug,
-        isRsvpActive
+        isRsvpActive,
+        closing.value
       ]
     );
 
@@ -642,9 +715,11 @@ exports.createPreEvent = async (req, res) => {
       });
     }
 
-    const isValidationError = /Linked live program|Community link/i.test(error.message || '');
-    console.error('Create pre-event error:', error);
-    return res.status(isValidationError ? 400 : 500).json({ error: error.message || 'Server error creating pre-event.' });
+    const described = describeCreateError(error);
+    if (described.status >= 500) console.error('Create pre-event error:', error);
+    const body = { error: described.error };
+    if (described.field) body.field = described.field;
+    return res.status(described.status).json(body);
   }
 };
 
@@ -1054,6 +1129,19 @@ exports.updatePreEvent = async (req, res) => {
       return res.status(400).json({ error: 'A valid event date and time is required.' });
     }
 
+    const closesAtSent = Object.prototype.hasOwnProperty.call(req.body, 'rsvpClosesAt');
+    const closing = parseRsvpClosesAt(closesAtSent ? req.body.rsvpClosesAt : existing.rsvp_closes_at, eventDate);
+    if (closing.error) {
+      // A saved closing time can fall outside the window when only the event date moved.
+      const error = closesAtSent ? closing.error : 'RSVPs are set to close more than 12 hours after the new event time. Move the closing time earlier first.';
+      return res.status(400).json({ error, field: 'rsvpClosesAt' });
+    }
+    const previousClose = toDate(existing.rsvp_closes_at);
+    const closeChanged = (closing.value?.getTime() || null) !== (previousClose?.getTime() || null);
+    if (closesAtSent && closeChanged && closing.value && closing.value.getTime() <= Date.now()) {
+      return res.status(400).json({ error: 'That closing time has already passed. Pick a time in the future.', field: 'rsvpClosesAt' });
+    }
+
     if (req.body.banner?.dataUrl) {
       uploadedBanner = await uploadEventFlyer({
         churchId: req.churchId,
@@ -1080,6 +1168,7 @@ exports.updatePreEvent = async (req, res) => {
            community_links = $14::jsonb,
            virtual_attendance_enabled = $15,
            is_rsvp_active = $16,
+           rsvp_closes_at = $19,
            updated_at = CURRENT_TIMESTAMP
        WHERE id = $17 AND church_id = $18
        RETURNING *`,
@@ -1101,7 +1190,8 @@ exports.updatePreEvent = async (req, res) => {
         virtualAttendanceEnabled,
         isRsvpActive,
         existing.id,
-        req.churchId
+        req.churchId,
+        closing.value
       ]
     );
 
@@ -1119,9 +1209,13 @@ exports.updatePreEvent = async (req, res) => {
       });
     }
 
-    const isValidationError = /Linked live program|Community link/i.test(error.message || '');
-    console.error('Update pre-event error:', error);
-    return res.status(isValidationError ? 400 : 500).json({ error: error.message || 'Server error updating pre-event.' });
+    const described = describeCreateError(error);
+    if (described.status >= 500) console.error('Update pre-event error:', error);
+    const body = {
+      error: described.status === 500 ? 'We could not save your changes. Please try again.' : described.error
+    };
+    if (described.field) body.field = described.field;
+    return res.status(described.status).json(body);
   }
 };
 
@@ -1152,12 +1246,13 @@ exports.getPublicPreEvent = async (req, res) => {
     const result = await pool.query(
       `SELECT pe.id, pe.title, pe.event_date, pe.description, pe.venue_name, pe.city,
               pe.banner_url, pe.rsvp_fields, pe.rsvp_field_config, pe.custom_form_schema, pe.community_links, pe.slug, pe.is_rsvp_active,
-              pe.discover_enabled, pe.virtual_attendance_enabled, c.church_name, COUNT(per.id) AS rsvp_count
+              pe.rsvp_closes_at, pe.discover_enabled, pe.virtual_attendance_enabled, c.church_name, c.logo_url AS church_logo_url,
+              COUNT(per.id) AS rsvp_count
        FROM pre_events pe
        JOIN churches c ON c.id = pe.church_id
        LEFT JOIN pre_event_rsvps per ON per.pre_event_id = pe.id
        WHERE pe.slug = $1
-       GROUP BY pe.id, c.church_name`,
+       GROUP BY pe.id, c.church_name, c.logo_url`,
       [req.params.slug]
     );
 
@@ -1172,17 +1267,45 @@ exports.getPublicPreEvent = async (req, res) => {
   }
 };
 
+// Public Discover list. Optional query params:
+//   q       search text (event title, city, venue, host or description)
+//   city    exact city name, or "online" for events that allow online attendance
+//   limit   1 to 60 (default 24)
+//   offset  for "Show more events"
+//   facets  "1" to also return the city chips (cities that actually have events)
 exports.getDiscoverPreEvents = async (req, res) => {
   try {
     const limit = Math.min(Math.max(parseInt(req.query.limit || '24', 10) || 24, 1), 60);
+    const offset = Math.min(Math.max(parseInt(req.query.offset || '0', 10) || 0, 0), 5000);
     const city = cleanText(req.query.city, 120);
-    const params = [limit];
-    let cityFilter = '';
+    const search = cleanText(req.query.q, 120);
+    const wantFacets = req.query.facets === '1' || req.query.facets === 'true';
+
+    const baseWhere = `pe.discover_enabled = TRUE
+         AND pe.is_rsvp_active = TRUE
+         AND pe.event_date >= (CURRENT_TIMESTAMP - INTERVAL '12 hours')
+         AND (pe.rsvp_closes_at IS NULL OR pe.rsvp_closes_at > CURRENT_TIMESTAMP)`;
+    const filters = [];
+    const filterParams = [];
 
     if (city) {
-      params.push(city);
-      cityFilter = ` AND LOWER(pe.city) = LOWER($${params.length})`;
+      if (city.toLowerCase() === 'online') {
+        filters.push('pe.virtual_attendance_enabled = TRUE');
+      } else {
+        filterParams.push(city);
+        filters.push(`LOWER(TRIM(pe.city)) = LOWER($${filterParams.length})`);
+      }
     }
+
+    if (search) {
+      filterParams.push(`%${search.replace(/[\\%_]/g, (character) => `\\${character}`)}%`);
+      const n = filterParams.length;
+      filters.push(`(pe.title ILIKE $${n} OR pe.city ILIKE $${n} OR pe.venue_name ILIKE $${n}
+           OR c.church_name ILIKE $${n} OR pe.description ILIKE $${n})`);
+    }
+
+    const where = [baseWhere, ...filters].join('\n         AND ');
+    const listParams = [...filterParams, limit, offset];
 
     const result = await pool.query(
       `SELECT pe.id, pe.title, pe.event_date, pe.description, pe.venue_name, pe.city,
@@ -1191,17 +1314,46 @@ exports.getDiscoverPreEvents = async (req, res) => {
        FROM pre_events pe
        JOIN churches c ON c.id = pe.church_id
        LEFT JOIN pre_event_rsvps per ON per.pre_event_id = pe.id
-       WHERE pe.discover_enabled = TRUE
-         AND pe.is_rsvp_active = TRUE
-         AND pe.event_date >= (CURRENT_TIMESTAMP - INTERVAL '12 hours')
-         ${cityFilter}
+       WHERE ${where}
        GROUP BY pe.id, c.church_name
        ORDER BY pe.event_date ASC, pe.created_at DESC
-       LIMIT $1`,
-      params
+       LIMIT $${filterParams.length + 1} OFFSET $${filterParams.length + 2}`,
+      listParams
     );
 
-    return res.json({ preEvents: result.rows.map(mapPreEvent) });
+    const countResult = await pool.query(
+      `SELECT COUNT(*) AS total
+       FROM pre_events pe
+       JOIN churches c ON c.id = pe.church_id
+       WHERE ${where}`,
+      filterParams
+    );
+    const total = parseInt(countResult.rows[0]?.total || 0, 10);
+
+    const payload = {
+      preEvents: result.rows.map(mapPreEvent),
+      total,
+      hasMore: offset + result.rows.length < total
+    };
+
+    if (wantFacets) {
+      const facetResult = await pool.query(
+        `SELECT INITCAP(LOWER(TRIM(pe.city))) AS city, COUNT(*) AS count
+         FROM pre_events pe
+         WHERE ${baseWhere}
+           AND COALESCE(TRIM(pe.city), '') <> ''
+         GROUP BY INITCAP(LOWER(TRIM(pe.city)))
+         ORDER BY COUNT(*) DESC, INITCAP(LOWER(TRIM(pe.city))) ASC
+         LIMIT 8`
+      );
+      const onlineResult = await pool.query(
+        `SELECT COUNT(*) AS count FROM pre_events pe WHERE ${baseWhere} AND pe.virtual_attendance_enabled = TRUE`
+      );
+      payload.cities = facetResult.rows.map((row) => ({ name: row.city, count: parseInt(row.count, 10) }));
+      payload.onlineCount = parseInt(onlineResult.rows[0]?.count || 0, 10);
+    }
+
+    return res.json(payload);
   } catch (error) {
     console.error('Get discover pre-events error:', error);
     return res.status(500).json({ error: 'Server error fetching discover events.' });
@@ -1227,6 +1379,10 @@ exports.submitPublicRsvp = async (req, res) => {
       return res.status(403).json({ error: 'RSVPs are currently closed for this event.' });
     }
 
+    if (getRsvpWindow(preEvent).ended) {
+      return res.status(403).json({ error: 'RSVPs have closed for this event.', code: 'RSVP_ENDED' });
+    }
+
     const payload = validateRsvpPayload(
       preEvent.rsvp_fields,
       preEvent.custom_form_schema || [],
@@ -1235,28 +1391,43 @@ exports.submitPublicRsvp = async (req, res) => {
       preEvent.rsvp_field_config || {}
     );
 
-    let rsvp = await insertPreEventRsvp(preEvent, payload, 'public');
-    const emailToken = generateRsvpCheckinToken();
-    let qrEmail = { sent: false };
-    try {
-      const sendResult = await sendAndRefreshRsvpQr(preEvent, rsvp, emailToken);
-      qrEmail = sendResult.emailResult;
-      rsvp = sendResult.rsvp;
-    } catch (emailError) {
-      console.error('RSVP QR email send failed:', emailError.message);
-      qrEmail = { sent: false, reason: emailError.message };
-    }
+    const rsvp = await insertPreEventRsvp(preEvent, payload, 'public');
 
-    return res.status(201).json({
+    // The spot is saved, so answer the guest now. Making the QR and emailing it can take
+    // several seconds (image upload + email provider); waiting for it made slow connections
+    // show an error even though the RSVP had worked. The email goes out straight after.
+    res.status(201).json({
       success: true,
       message: 'Your access is secured. See you there!',
-      qrEmailSent: Boolean(qrEmail.sent),
-      emailWarning: !qrEmail.sent ? (qrEmail.reason || 'Your QR email could not be sent yet.') : null,
+      qrEmailQueued: true,
+      qrEmailSent: false,
+      emailWarning: null,
+      sentTo: rsvp.email_address || payload.emailAddress || null,
       rsvp: mapRsvp(rsvp)
     });
+
+    // If this email fails, the RSVP shows "Not sent" on the organizer's dashboard, where it can be resent.
+    // Returned so tests can wait for it; Express ignores it, and it never rejects.
+    return sendAndRefreshRsvpQr(preEvent, rsvp, generateRsvpCheckinToken())
+      .then(({ emailResult }) => {
+        if (!emailResult?.sent) {
+          console.error(`RSVP QR email not sent (RSVP ${rsvp.id}):`, emailResult?.reason || 'unknown reason');
+        }
+      })
+      .catch((emailError) => {
+        console.error(`RSVP QR email send failed (RSVP ${rsvp.id}):`, emailError.message);
+      });
   } catch (error) {
+    if (res.headersSent) {
+      console.error('Submit public RSVP error after responding:', error);
+      return undefined;
+    }
+
     if (error.code === '23505') {
-      return res.status(409).json({ error: 'This email has already secured access for this event.' });
+      return res.status(409).json({
+        error: "You've already RSVP'd with this email. Check your inbox and spam folder for your QR pass from Ingather.",
+        code: 'ALREADY_REGISTERED'
+      });
     }
 
     const isValidationError = /required|valid email|valid http|age must|valid gender|invalid option|select how/i.test(error.message || '');
@@ -1375,3 +1546,63 @@ exports.resendRsvpQrEmail = async (req, res) => {
 
 // Exported for unit tests.
 exports.validateRsvpPayload = validateRsvpPayload;
+
+// Public RSVP pass: the guest opens their pass from the link in their RSVP email.
+// It returns only what the pass shows. Never the guest's email, phone or answers.
+exports.getPublicRsvpPass = async (req, res) => {
+  try {
+    const rawToken = String(req.params.token || '').trim();
+    const normalized = normalizeRsvpCheckinToken(rawToken);
+    if (normalized.length < 6 || normalized.length > 64) {
+      return res.status(404).json({ error: 'This pass link is not valid.' });
+    }
+
+    const hashes = [...new Set([
+      hashRsvpCheckinToken(normalized),
+      crypto.createHash('sha256').update(rawToken).digest('hex')
+    ])];
+
+    const result = await pool.query(
+      `SELECT per.full_name, per.attendance_mode, per.status, per.checked_in_at,
+              pe.title, pe.event_date, pe.venue_name, pe.city, pe.banner_url, pe.slug,
+              pe.virtual_attendance_enabled, c.church_name,
+              p.is_active AS program_is_active
+       FROM pre_event_rsvps per
+       JOIN pre_events pe ON pe.id = per.pre_event_id
+       JOIN churches c ON c.id = pe.church_id
+       LEFT JOIN programs p ON p.id = pe.program_id
+       WHERE per.checkin_token_hash = ANY($1::text[])
+       LIMIT 1`,
+      [hashes]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'This pass link is not valid.' });
+    }
+
+    const row = result.rows[0];
+    return res.json({
+      pass: {
+        guestName: row.full_name || '',
+        attendanceMode: row.attendance_mode || null,
+        checkedIn: row.status === 'checked_in',
+        checkedInAt: row.checked_in_at,
+        code: normalized,
+        event: {
+          title: row.title,
+          organizerName: row.church_name,
+          eventDate: row.event_date,
+          venueName: row.venue_name,
+          city: row.city,
+          bannerUrl: row.banner_url,
+          slug: row.slug,
+          virtualAttendanceEnabled: Boolean(row.virtual_attendance_enabled),
+          checkInClosed: row.program_is_active === false
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Get RSVP pass error:', error);
+    return res.status(500).json({ error: 'Server error loading this pass.' });
+  }
+};

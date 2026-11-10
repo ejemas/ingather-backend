@@ -72,6 +72,7 @@ const notificationRoutes = require('./routes/notificationRoutes');
 const preEventRoutes = require('./routes/preEventRoutes');
 const waitlistRoutes = require('./routes/waitlistRoutes');
 const rsvpScannerRoutes = require('./routes/rsvpScannerRoutes');
+const helpRoutes = require('./routes/helpRoutes');
 
 // API Routes
 app.get('/', (req, res) => {
@@ -92,6 +93,13 @@ app.get('/api/health', (req, res) => {
   res.status(200).json(getHealthPayload());
 });
 
+// End events 12 hours after their end time before answering, so old links stop working on time.
+const { autoEndMiddleware, startAutoEndTimer } = require('./utils/autoEndPrograms');
+const autoEndCheck = autoEndMiddleware(require('./config/database'));
+app.use('/api/scan/program/:programId', autoEndCheck);
+app.use('/api/programs', autoEndCheck);
+app.use('/api/rsvp-scanner', autoEndCheck);
+
 app.use('/api/auth', authRoutes);
 app.use('/api/programs', programRoutes);
 app.use('/api/scan', scanRoutes);
@@ -99,6 +107,7 @@ app.use('/api/notifications', notificationRoutes);
 app.use('/api/pre-events', preEventRoutes);
 app.use('/api/waitlist', waitlistRoutes);
 app.use('/api/rsvp-scanner', rsvpScannerRoutes);
+app.use('/api/help', helpRoutes);
 
 // Socket.io connection
 io.on('connection', (socket) => {
@@ -415,7 +424,12 @@ pool.query(`
   CREATE INDEX IF NOT EXISTS idx_attendees_program_checked_in ON attendees(program_id, checked_in_at DESC);
 `)
   .then(() => console.log('Migration check: pre-event RSVP tables ready'))
-  .catch(err => console.error('Migration warning (pre-events):', err.message));
+  .catch(err => console.error('Migration warning (pre-events):', err.message))
+  // RSVP closing time (9 Nov 2026). Kept as its own step so a problem in the block above can't stop it.
+  // Same as backend/sql/2026-11-09-rsvp-close-date.sql: adds one empty column, safe to run every start.
+  .then(() => pool.query('ALTER TABLE pre_events ADD COLUMN IF NOT EXISTS rsvp_closes_at TIMESTAMP'))
+  .then(() => console.log('Migration check: RSVP closing time column ready'))
+  .catch(err => console.error('Migration warning (RSVP closing time):', err.message));
 
 // Auto-migrate: create notifications tables if they don't exist
 pool.query(`
@@ -501,6 +515,7 @@ pool.query(`
   .catch(err => console.error('Migration warning (waitlist):', err.message));
 
 server.listen(PORT, () => {
+  startAutoEndTimer(pool, io);
   console.log(`
 🚀 Server is running on port ${PORT}
 🌐 Frontend URL: ${process.env.FRONTEND_URL}

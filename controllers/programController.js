@@ -410,7 +410,37 @@ const getUnreadCountForChurch = async (churchId) => {
   return parseInt(result.rows[0].unread, 10);
 };
 
-const buildDashboardStatsPayload = async (churchId, startDate, endDate) => {
+// Dashboard dates come from the browser. Accept only real YYYY-MM-DD values.
+const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const cleanDateParam = (value) => {
+  if (typeof value !== 'string' || !DATE_ONLY_PATTERN.test(value)) return null;
+  const parsed = new Date(`${value}T00:00:00Z`);
+  return Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value ? null : value;
+};
+
+// The organizer's own "today" (e.g. Lagos is UTC+1), trusted only within a day of the server.
+const resolveDashboardToday = (clientToday) => {
+  const serverToday = getTodayDateOnly();
+  const cleaned = cleanDateParam(clientToday);
+  if (!cleaned) return serverToday;
+  const diffDays = Math.abs(Date.parse(`${cleaned}T00:00:00Z`) - Date.parse(`${serverToday}T00:00:00Z`)) / 86400000;
+  return diffDays <= 1 ? cleaned : serverToday;
+};
+
+const getPreviousPeriod = (startDate, endDate) => {
+  if (!startDate || !endDate) return null;
+  const start = Date.parse(`${startDate}T00:00:00Z`);
+  const end = Date.parse(`${endDate}T00:00:00Z`);
+  if (!(end >= start)) return null;
+  const days = Math.round((end - start) / 86400000) + 1;
+  const prevEnd = new Date(start - 86400000).toISOString().slice(0, 10);
+  const prevStart = new Date(start - days * 86400000).toISOString().slice(0, 10);
+  return { prevStart, prevEnd };
+};
+
+const buildDashboardStatsPayload = async (churchId, rawStartDate, rawEndDate, clientToday) => {
+  const startDate = cleanDateParam(rawStartDate);
+  const endDate = cleanDateParam(rawEndDate);
   let dateFilter = '';
   const params = [churchId];
   let paramIndex = 2;
@@ -429,9 +459,10 @@ const buildDashboardStatsPayload = async (churchId, startDate, endDate) => {
     paramIndex += 1;
   }
 
-  const today = getTodayDateOnly();
+  const today = resolveDashboardToday(clientToday);
   const upcomingParams = [churchId, today];
   const programListQuery = buildProgramListQueryParts(churchId, startDate, endDate, today);
+  const previousPeriod = getPreviousPeriod(startDate, endDate);
 
   const [
     summaryResult,
@@ -439,7 +470,14 @@ const buildDashboardStatsPayload = async (churchId, startDate, endDate) => {
     scanStatsResult,
     attendeeStatsResult,
     chartResult,
-    programsResult
+    programsResult,
+    allTimeResult,
+    preEventCountResult,
+    nextUpcomingResult,
+    checkinStatsResult,
+    previousAttendanceResult,
+    byEventResult,
+    liveResult
   ] = await Promise.all([
     pool.query(
       `SELECT COUNT(*) as total_programs, COALESCE(SUM(total_scans), 0) as total_attendance
@@ -490,6 +528,55 @@ const buildDashboardStatsPayload = async (churchId, startDate, endDate) => {
        WHERE ${programListQuery.whereClause}
        ORDER BY p.date DESC, p.start_time DESC`,
       programListQuery.params
+    ),
+    pool.query('SELECT COUNT(*) AS total FROM programs WHERE church_id = $1', [churchId]),
+    pool.query('SELECT COUNT(*) AS total FROM pre_events WHERE church_id = $1', [churchId])
+      .catch(() => ({ rows: [{ total: 0 }] })),
+    pool.query(
+      `SELECT id, title, date, start_time
+       FROM programs p
+       WHERE p.church_id = $1 AND p.date > $2::date AND p.is_active = true
+       ORDER BY p.date ASC, p.start_time ASC
+       LIMIT 1`,
+      upcomingParams
+    ),
+    // Every check-in writes one scans row, so scans alone is the guest count (no double counting).
+    pool.query(
+      `SELECT
+        COUNT(*) AS total,
+        COUNT(CASE WHEN s.gender = 'female' THEN 1 END) AS female_count,
+        COUNT(CASE WHEN s.gender = 'male' THEN 1 END) AS male_count,
+        COUNT(CASE WHEN s.first_timer = true THEN 1 END) AS first_timer_count
+       FROM scans s
+       JOIN programs p ON s.program_id = p.id
+       WHERE p.church_id = $1${dateFilter}`,
+      params
+    ),
+    previousPeriod
+      ? pool.query(
+        `SELECT COUNT(*) AS total_programs, COALESCE(SUM(total_scans), 0) AS total_attendance
+         FROM programs p
+         WHERE p.church_id = $1 AND p.date >= $2::date AND p.date <= $3::date`,
+        [churchId, previousPeriod.prevStart, previousPeriod.prevEnd]
+      )
+      : Promise.resolve(null),
+    pool.query(
+      `SELECT p.id, p.title, p.date, p.start_time, p.is_active, COALESCE(p.total_scans, 0) AS total_scans
+       FROM programs p
+       WHERE p.church_id = $1${dateFilter} AND p.date <= $${paramIndex}::date
+       ORDER BY p.date ASC, p.start_time ASC
+       LIMIT 120`,
+      [...params, today]
+    ),
+    pool.query(
+      `SELECT p.id, p.title, p.date, p.start_time, p.end_time, p.flyer_url,
+              COALESCE(p.total_scans, 0) AS total_scans,
+              (SELECT COUNT(*) FROM scans s WHERE s.program_id = p.id AND s.scan_time >= NOW() - INTERVAL '10 minutes') AS recent_scans
+       FROM programs p
+       WHERE p.church_id = $1 AND p.is_active = true AND p.date = $2::date
+       ORDER BY p.start_time DESC
+       LIMIT 1`,
+      upcomingParams
     )
   ]);
 
@@ -498,7 +585,60 @@ const buildDashboardStatsPayload = async (churchId, startDate, endDate) => {
   const totalFirstTimer = parseInt(scanStatsResult.rows[0].first_timer_count, 10) + parseInt(attendeeStatsResult.rows[0].first_timer_count, 10);
   const totalPeople = totalMale + totalFemale + totalFirstTimer;
 
+  const checkins = checkinStatsResult.rows[0] || {};
+  const checkinTotal = parseInt(checkins.total, 10) || 0;
+  const checkinFemale = parseInt(checkins.female_count, 10) || 0;
+  const checkinMale = parseInt(checkins.male_count, 10) || 0;
+  const checkinFirstTimers = parseInt(checkins.first_timer_count, 10) || 0;
+  const currentAttendance = parseInt(summaryResult.rows[0].total_attendance, 10) || 0;
+  const previousAttendance = previousAttendanceResult
+    ? parseInt(previousAttendanceResult.rows[0].total_attendance, 10) || 0
+    : null;
+  const previousPrograms = previousAttendanceResult
+    ? parseInt(previousAttendanceResult.rows[0].total_programs, 10) || 0
+    : 0;
+  const nextUpcoming = nextUpcomingResult.rows[0] || null;
+  const liveRow = liveResult.rows[0] || null;
+
   return {
+    today,
+    totalProgramsAllTime: parseInt(allTimeResult.rows[0].total, 10) || 0,
+    preEventCount: parseInt(preEventCountResult.rows[0].total, 10) || 0,
+    nextUpcoming: nextUpcoming
+      ? { id: nextUpcoming.id, title: nextUpcoming.title, date: nextUpcoming.date, startTime: nextUpcoming.start_time }
+      : null,
+    attendanceChange: previousAttendance !== null && previousPrograms > 0 && previousAttendance > 0
+      ? {
+        previous: previousAttendance,
+        percent: Math.round(((currentAttendance - previousAttendance) / previousAttendance) * 100)
+      }
+      : null,
+    checkins: {
+      total: checkinTotal,
+      female: checkinFemale,
+      male: checkinMale,
+      firstTimers: checkinFirstTimers
+    },
+    attendanceByEvent: byEventResult.rows.map(row => ({
+      id: row.id,
+      title: row.title,
+      date: row.date,
+      startTime: row.start_time,
+      attendance: parseInt(row.total_scans, 10) || 0,
+      status: getProgramStatus(row, today)
+    })),
+    live: liveRow
+      ? {
+        id: liveRow.id,
+        title: liveRow.title,
+        date: liveRow.date,
+        startTime: liveRow.start_time,
+        endTime: liveRow.end_time,
+        flyerUrl: liveRow.flyer_url || null,
+        checkedIn: parseInt(liveRow.total_scans, 10) || 0,
+        lastTenMinutes: parseInt(liveRow.recent_scans, 10) || 0
+      }
+      : null,
     totalPrograms: parseInt(summaryResult.rows[0].total_programs, 10),
     totalAttendance: parseInt(summaryResult.rows[0].total_attendance, 10),
     upcomingPrograms: parseInt(upcomingResult.rows[0].upcoming_count, 10),
@@ -794,9 +934,60 @@ const checkInRsvpForProgram = async ({ programId, churchId, token, io }) => {
   }
 };
 
+// Turns a create-event failure into a message the organizer can act on, with the form field it
+// belongs to where there is one. Storage and database details stay in the server log.
+const TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/;
+const describeCreateProgramError = (error, fallback = 'We could not create the event. Please try again.') => {
+  const message = error?.message || '';
+  const sponsorField = { status: 400, field: 'sponsors' };
+  if (/Sponsor CTA link/i.test(message)) return { ...sponsorField, error: 'Each sponsor needs a button link that starts with https://' };
+  if (/Sponsor CTA text/i.test(message)) return { ...sponsorField, error: 'Each sponsor needs button text.' };
+  if (/Sponsor name/i.test(message)) return { ...sponsorField, error: 'Each sponsor needs a name.' };
+  if (/sponsor needs a flyer/i.test(message)) return { ...sponsorField, error: 'Each sponsor needs a flyer image.' };
+  if (/up to 12 sponsors/i.test(message)) return { ...sponsorField, error: 'You can add up to 12 sponsors.' };
+  if (/add up to exactly 100/i.test(message)) return { ...sponsorField, error: 'Sponsor shares must add up to exactly 100%.' };
+  if (/percentage between 1 and 100/i.test(message)) return { ...sponsorField, error: 'Each sponsor needs a share of guests from 1 to 100.' };
+  if (/Sponsors must be an array/i.test(message)) return { ...sponsorField, error: 'The sponsor list could not be read. Please try again.' };
+  if (/payload is invalid|valid JPEG, PNG, or WebP|type is not supported/i.test(message)) {
+    return { status: 400, field: 'flyer', error: 'One of your images could not be read. Use JPEG, PNG or WebP images.' };
+  }
+  if (/still too large/i.test(message)) return { status: 400, field: 'flyer', error: 'One of your images is too large even after compressing. Try a smaller image.' };
+  if (/flyer upload failed|storage is not configured/i.test(message)) {
+    return { status: 502, error: 'We could not upload your images right now. Please try again in a moment.' };
+  }
+  return { status: 500, error: fallback };
+};
+
 // Create Program
 exports.createProgram = async (req, res) => {
   try {
+    // Checks the form also makes, repeated here so a bad request can't save a broken event.
+    const rawTitle = typeof req.body.programTitle === 'string' ? req.body.programTitle.trim() : '';
+    if (!rawTitle) {
+      return res.status(400).json({ error: 'Give your event a name.', field: 'programTitle' });
+    }
+    if (rawTitle.length > 255) {
+      return res.status(400).json({ error: 'Keep the event name under 255 characters.', field: 'programTitle' });
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(req.body.date || '')) || Number.isNaN(new Date(`${req.body.date}T00:00:00Z`).getTime())) {
+      return res.status(400).json({ error: 'Pick a valid date.', field: 'date' });
+    }
+    if (!TIME_PATTERN.test(String(req.body.startTime || ''))) {
+      return res.status(400).json({ error: 'Pick a valid start time.', field: 'startTime' });
+    }
+    if (!TIME_PATTERN.test(String(req.body.endTime || ''))) {
+      return res.status(400).json({ error: 'Pick a valid end time.', field: 'endTime' });
+    }
+    if (String(req.body.endTime).slice(0, 5) <= String(req.body.startTime).slice(0, 5)) {
+      return res.status(400).json({ error: 'End time must be after the start time.', field: 'endTime' });
+    }
+    if (req.body.enableGifting === true && req.body.trackingMode === 'collect-data') {
+      const winners = Number(req.body.numberOfWinners);
+      if (!Number.isInteger(winners) || winners < 1 || winners > 1000) {
+        return res.status(400).json({ error: 'Choose between 1 and 1,000 gift winners.', field: 'numberOfWinners' });
+      }
+    }
+
     const {
       programTitle,
       date,
@@ -841,7 +1032,7 @@ exports.createProgram = async (req, res) => {
 
     if (sponsorDisplayMode === 'distribution' && normalizedSponsors.length > 0) {
       if (!Number.isInteger(normalizedSponsorExpectedAttendees) || normalizedSponsorExpectedAttendees < 1) {
-        return res.status(400).json({ error: 'Expected attendees is required for percentage distribution sponsors' });
+        return res.status(400).json({ error: 'Enter how many guests you expect, so sponsor cards can be shared out.', field: 'sponsorExpectedAttendees' });
       }
     }
 
@@ -849,7 +1040,7 @@ exports.createProgram = async (req, res) => {
       resolvedDataFields.fullName = true;
 
       if (!resolvedPersonalizedConfig.template) {
-        return res.status(400).json({ error: 'Personalized flyer message is required' });
+        return res.status(400).json({ error: 'Add at least one message for the personalized flyer.', field: 'messages' });
       }
     }
 
@@ -1052,11 +1243,376 @@ exports.createProgram = async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Create program error:', error);
-    const isFlyerError = error.message?.includes('flyer') || error.message?.includes('Flyer') || error.message?.includes('Supabase') || error.message?.includes('Sponsor') || error.message?.includes('sponsor') || error.message?.includes('distribution');
-    res.status(isFlyerError ? 400 : 500).json({
-      error: isFlyerError ? error.message : 'Server error creating program'
+    const described = describeCreateProgramError(error);
+    if (described.status >= 500) console.error('Create program error:', error);
+    const body = { error: described.error };
+    if (described.field) body.field = described.field;
+    res.status(described.status).json(body);
+  }
+};
+
+/* ---------------- Edit an event ---------------- */
+
+const pad2 = (value) => String(value).padStart(2, '0');
+// DATE columns come back as Date objects at local midnight; the form wants YYYY-MM-DD.
+const toDateInput = (value) => {
+  if (!value) return '';
+  if (value instanceof Date) return `${value.getFullYear()}-${pad2(value.getMonth() + 1)}-${pad2(value.getDate())}`;
+  return String(value).slice(0, 10);
+};
+const toTimeInput = (value) => String(value || '').slice(0, 5);
+
+// Once anyone has checked in, the parts of the event their check-in depended on are locked.
+const countProgramCheckins = async (db, programId, totalScans) => {
+  const result = await db.query('SELECT COUNT(*)::int AS count FROM attendees WHERE program_id = $1', [programId]);
+  return Math.max(Number(result.rows[0]?.count || 0), Number(totalScans || 0));
+};
+
+const getActiveSponsorRows = async (db, programId) => {
+  const result = await db.query(
+    `SELECT * FROM event_sponsors
+     WHERE program_id = $1 AND is_active = true
+     ORDER BY display_order ASC, created_at ASC`,
+    [programId]
+  );
+  return result.rows;
+};
+
+const mapProgramForEdit = (program, sponsorRows, checkinsCount) => ({
+  id: program.id,
+  title: program.title,
+  date: toDateInput(program.date),
+  startTime: toTimeInput(program.start_time),
+  endTime: toTimeInput(program.end_time),
+  trackingMode: program.tracking_mode,
+  dataFields: program.data_fields || {},
+  dataFieldConfig: normalizeFieldConfig(program.data_field_config || {}),
+  customFormSchema: program.custom_form_schema || [],
+  giftingEnabled: program.gifting_enabled === true,
+  totalWinners: Number(program.total_winners || 0),
+  winnersSelected: Number(program.winners_selected || 0),
+  flyerType: program.flyer_type || 'standard',
+  flyerUrl: program.flyer_url || null,
+  flyerOriginalName: program.flyer_original_name || null,
+  personalizedFlyerConfig: program.personalized_flyer_config || null,
+  personalizedBackgroundUrl: program.personalized_background_url || null,
+  personalizedBackgroundOriginalName: program.personalized_background_original_name || null,
+  personalizedLogoUrl: program.personalized_logo_url || null,
+  personalizedLogoOriginalName: program.personalized_logo_original_name || null,
+  sponsorDisplayMode: program.sponsor_display_mode || 'carousel',
+  sponsorExpectedAttendees: program.sponsor_expected_attendees,
+  proxyCheckinEnabled: program.proxy_checkin_enabled === true,
+  strictDeviceFingerprinting: program.strict_device_fingerprinting !== false,
+  isActive: program.is_active !== false,
+  checkinsCount,
+  locked: checkinsCount > 0,
+  sponsors: sponsorRows.map((row) => ({
+    id: row.id,
+    sponsorName: row.sponsor_name,
+    flyerUrl: row.flyer_url,
+    flyerOriginalName: row.flyer_original_name,
+    ctaText: row.cta_text,
+    ctaLink: row.cta_link,
+    boothText: row.booth_text || '',
+    campaignTag: row.campaign_tag || '',
+    tier: row.tier || '',
+    distributionPercentage: row.distribution_percentage,
+    clickCount: Number(row.click_count || 0)
+  }))
+});
+
+// Get everything the Edit Event page needs (protected)
+exports.getProgramForEdit = async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM programs WHERE id = $1 AND church_id = $2', [req.params.id, req.churchId]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Event not found.' });
+    }
+    const program = result.rows[0];
+    const [checkinsCount, sponsorRows] = await Promise.all([
+      countProgramCheckins(pool, program.id, program.total_scans),
+      getActiveSponsorRows(pool, program.id)
+    ]);
+    return res.json({ program: mapProgramForEdit(program, sponsorRows, checkinsCount) });
+  } catch (error) {
+    console.error('Get program for edit error:', error);
+    return res.status(500).json({ error: 'We could not load this event. Please try again.' });
+  }
+};
+
+// Sponsors sent from the Edit page: existing ones carry their id and only send a flyer when it changed.
+const normalizeSponsorsForUpdate = (sponsors, displayMode, existingById) => {
+  if (!Array.isArray(sponsors)) throw new Error('Sponsors must be an array');
+  const seen = new Set();
+  const normalized = sponsors
+    .filter((sponsor) => sponsor && typeof sponsor === 'object')
+    .map((sponsor, index) => {
+      const id = sponsor.id ? String(sponsor.id) : null;
+      if (id && (!existingById.has(id) || seen.has(id))) {
+        const missing = new Error('SPONSOR_NOT_FOUND');
+        missing.code = 'SPONSOR_NOT_FOUND';
+        throw missing;
+      }
+      if (id) seen.add(id);
+      const percentage = sponsor.distributionPercentage === '' || sponsor.distributionPercentage === null || sponsor.distributionPercentage === undefined
+        ? null
+        : Number(sponsor.distributionPercentage);
+      if (displayMode === 'distribution' && (!Number.isInteger(percentage) || percentage < 1 || percentage > 100)) {
+        throw new Error('Each distribution sponsor must have a percentage between 1 and 100');
+      }
+      if (!id && !sponsor.flyer?.dataUrl) throw new Error('Each sponsor needs a flyer image');
+      return {
+        id,
+        sponsorName: cleanRequiredText(sponsor.sponsorName, 'Sponsor name'),
+        ctaText: cleanRequiredText(sponsor.ctaText || 'Learn More', 'Sponsor CTA text', 80),
+        ctaLink: normalizeSponsorUrl(sponsor.ctaLink),
+        boothText: cleanOptionalText(sponsor.boothText, 160),
+        campaignTag: cleanOptionalText(sponsor.campaignTag, 160),
+        tier: displayMode === 'carousel' ? cleanOptionalText(sponsor.tier, 120) : null,
+        distributionPercentage: displayMode === 'distribution' ? percentage : null,
+        displayOrder: index,
+        flyer: sponsor.flyer?.dataUrl ? sponsor.flyer : null
+      };
     });
+  if (normalized.length > 12) throw new Error('You can add up to 12 sponsors per program');
+  if (displayMode === 'distribution' && normalized.length > 0) {
+    const total = normalized.reduce((sum, sponsor) => sum + sponsor.distributionPercentage, 0);
+    if (total !== 100) throw new Error('Sponsor distribution percentages must add up to exactly 100');
+  }
+  return normalized;
+};
+
+// Save changes to an event (protected). The QR code and links never change.
+exports.updateProgram = async (req, res) => {
+  const newUploads = [];
+  try {
+    const result = await pool.query('SELECT * FROM programs WHERE id = $1 AND church_id = $2', [req.params.id, req.churchId]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Event not found.' });
+    }
+    const existing = result.rows[0];
+    const body = req.body || {};
+    const checkinsCount = await countProgramCheckins(pool, existing.id, existing.total_scans);
+    const locked = checkinsCount > 0;
+
+    const title = typeof body.programTitle === 'string' ? body.programTitle.trim() : '';
+    if (!title) return res.status(400).json({ error: 'Give your event a name.', field: 'programTitle' });
+    if (title.length > 255) return res.status(400).json({ error: 'Keep the event name under 255 characters.', field: 'programTitle' });
+
+    // Locked once guests have checked in: date, start time, check-in method and the form.
+    const date = locked ? toDateInput(existing.date) : String(body.date || '');
+    const startTime = locked ? toTimeInput(existing.start_time) : String(body.startTime || '');
+    const endTime = String(body.endTime || '');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(new Date(`${date}T00:00:00Z`).getTime())) {
+      return res.status(400).json({ error: 'Pick a valid date.', field: 'date' });
+    }
+    if (!TIME_PATTERN.test(startTime)) return res.status(400).json({ error: 'Pick a valid start time.', field: 'startTime' });
+    if (!TIME_PATTERN.test(endTime)) return res.status(400).json({ error: 'Pick a valid end time.', field: 'endTime' });
+    if (endTime.slice(0, 5) <= startTime.slice(0, 5)) {
+      return res.status(400).json({ error: 'End time must be after the start time.', field: 'endTime' });
+    }
+
+    const trackingMode = locked ? existing.tracking_mode : (body.trackingMode === 'collect-data' ? 'collect-data' : 'count-only');
+    const collect = trackingMode === 'collect-data';
+    let dataFields = locked ? (existing.data_fields || {}) : (collect ? { ...(body.dataFields || {}) } : {});
+    const dataFieldConfig = locked ? normalizeFieldConfig(existing.data_field_config || {}) : normalizeFieldConfig(body.dataFieldConfig || {});
+    const customFormSchema = locked ? (existing.custom_form_schema || []) : (collect ? normalizeCustomFieldSchema(body.customFormSchema || []) : []);
+
+    const flyerType = normalizeFlyerType(body.flyerType);
+    const personalizedConfig = normalizePersonalizedFlyerConfig(body.personalizedFlyerConfig || {});
+    if (flyerType === 'personalized') {
+      if (!collect) {
+        return res.status(400).json({ error: 'The personalized flyer needs Collect details, since it uses names.', field: 'messages' });
+      }
+      if (!dataFields.fullName) {
+        if (locked) {
+          return res.status(400).json({ error: "The personalized flyer needs guests' names, but this form doesn't ask for them and can't change now.", field: 'messages' });
+        }
+        dataFields = { ...dataFields, fullName: true };
+      }
+      if (!personalizedConfig.template) {
+        return res.status(400).json({ error: 'Add at least one message for the personalized flyer.', field: 'messages' });
+      }
+    }
+
+    const enableGifting = collect && body.enableGifting === true;
+    const winnersSelected = Number(existing.winners_selected || 0);
+    let totalWinners = 0;
+    if (enableGifting) {
+      totalWinners = Number(body.numberOfWinners);
+      if (!Number.isInteger(totalWinners) || totalWinners < 1 || totalWinners > 1000) {
+        return res.status(400).json({ error: 'Choose between 1 and 1,000 gift winners.', field: 'numberOfWinners' });
+      }
+      if (totalWinners < winnersSelected) {
+        return res.status(400).json({
+          error: `${winnersSelected} ${winnersSelected === 1 ? 'winner has' : 'winners have'} already been drawn, so you can't choose fewer than ${winnersSelected}.`,
+          field: 'numberOfWinners'
+        });
+      }
+    }
+
+    const sponsorDisplayMode = normalizeSponsorDisplayMode(body.sponsorDisplayMode);
+    const existingSponsors = await getActiveSponsorRows(pool, existing.id);
+    const existingById = new Map(existingSponsors.map((row) => [String(row.id), row]));
+    const sponsors = normalizeSponsorsForUpdate(body.sponsors || [], sponsorDisplayMode, existingById);
+    const expectedAttendees = sponsorDisplayMode === 'distribution' && sponsors.length > 0 ? Number(body.sponsorExpectedAttendees) : null;
+    if (sponsorDisplayMode === 'distribution' && sponsors.length > 0 && (!Number.isInteger(expectedAttendees) || expectedAttendees < 1)) {
+      return res.status(400).json({ error: 'Enter how many guests you expect, so sponsor cards can be shared out.', field: 'sponsorExpectedAttendees' });
+    }
+
+    // Upload new images first; nothing is saved if any upload fails.
+    const upload = async (dataUrl, folder) => {
+      const uploaded = await uploadEventFlyer({ churchId: req.churchId, dataUrl, ...(folder ? { folder } : {}) });
+      newUploads.push(uploaded.flyerStoragePath);
+      return uploaded;
+    };
+    const oldPathsToDelete = [];
+
+    let flyer = { url: existing.flyer_url, path: existing.flyer_storage_path, name: existing.flyer_original_name };
+    if (flyerType === 'standard' && body.eventFlyer?.dataUrl) {
+      const uploaded = await upload(body.eventFlyer.dataUrl);
+      if (flyer.path) oldPathsToDelete.push(flyer.path);
+      flyer = { url: uploaded.flyerUrl, path: uploaded.flyerStoragePath, name: body.eventFlyer.originalName || null };
+    } else if (body.removeEventFlyer === true) {
+      if (flyer.path) oldPathsToDelete.push(flyer.path);
+      flyer = { url: null, path: null, name: null };
+    }
+
+    const replaceImage = async (payload, remove, prefix) => {
+      let image = {
+        url: existing[`${prefix}_url`],
+        path: existing[`${prefix}_storage_path`],
+        name: existing[`${prefix}_original_name`]
+      };
+      if (flyerType === 'personalized' && payload?.dataUrl) {
+        const uploaded = await upload(payload.dataUrl);
+        if (image.path) oldPathsToDelete.push(image.path);
+        image = { url: uploaded.flyerUrl, path: uploaded.flyerStoragePath, name: payload.originalName || null };
+      } else if (remove === true) {
+        if (image.path) oldPathsToDelete.push(image.path);
+        image = { url: null, path: null, name: null };
+      }
+      return image;
+    };
+    const background = await replaceImage(body.personalizedBackground, body.removePersonalizedBackground, 'personalized_background');
+    const logo = await replaceImage(body.personalizedLogo, body.removePersonalizedLogo, 'personalized_logo');
+
+    for (const sponsor of sponsors) {
+      if (sponsor.flyer?.dataUrl) {
+        const uploaded = await upload(sponsor.flyer.dataUrl, 'sponsors');
+        sponsor.newFlyer = { url: uploaded.flyerUrl, path: uploaded.flyerStoragePath, name: sponsor.flyer.originalName || null };
+        const previous = sponsor.id ? existingById.get(sponsor.id) : null;
+        if (previous?.flyer_storage_path) oldPathsToDelete.push(previous.flyer_storage_path);
+      }
+    }
+
+    const personalizedForStorage = flyerType === 'personalized'
+      ? { ...personalizedConfig, backgroundUrl: background.url || null, logoUrl: logo.url || null }
+      : null;
+    const keptIds = new Set(sponsors.filter((sponsor) => sponsor.id).map((sponsor) => sponsor.id));
+
+    const client = await pool.connect();
+    let updated;
+    try {
+      await client.query('BEGIN');
+      const updateResult = await client.query(
+        `UPDATE programs SET
+           title = $1, date = $2, start_time = $3, end_time = $4, tracking_mode = $5,
+           data_fields = $6, data_field_config = $7, custom_form_schema = $8::jsonb,
+           gifting_enabled = $9, total_winners = $10, flyer_type = $11,
+           flyer_url = $12, flyer_storage_path = $13, flyer_original_name = $14,
+           personalized_flyer_config = $15,
+           personalized_background_url = $16, personalized_background_storage_path = $17, personalized_background_original_name = $18,
+           personalized_logo_url = $19, personalized_logo_storage_path = $20, personalized_logo_original_name = $21,
+           sponsor_display_mode = $22, sponsor_expected_attendees = $23,
+           proxy_checkin_enabled = $24, strict_device_fingerprinting = $25
+         WHERE id = $26 AND church_id = $27
+         RETURNING *`,
+        [
+          title, date, startTime, endTime, trackingMode,
+          JSON.stringify(dataFields), JSON.stringify(dataFieldConfig), JSON.stringify(customFormSchema),
+          enableGifting, totalWinners, flyerType,
+          flyer.url, flyer.path, flyer.name,
+          personalizedForStorage ? JSON.stringify(personalizedForStorage) : null,
+          background.url, background.path, background.name,
+          logo.url, logo.path, logo.name,
+          sponsorDisplayMode, expectedAttendees,
+          collect && body.proxyCheckinEnabled === true,
+          !collect || body.strictDeviceFingerprinting !== false,
+          existing.id, req.churchId
+        ]
+      );
+      updated = updateResult.rows[0];
+
+      for (const sponsor of sponsors) {
+        if (sponsor.id) {
+          await client.query(
+            `UPDATE event_sponsors SET
+               sponsor_name = $1, cta_text = $2, cta_link = $3, booth_text = $4, campaign_tag = $5, tier = $6,
+               distribution_percentage = $7, display_order = $8,
+               flyer_url = COALESCE($9, flyer_url), flyer_storage_path = COALESCE($10, flyer_storage_path),
+               flyer_original_name = COALESCE($11, flyer_original_name),
+               updated_at = CURRENT_TIMESTAMP
+             WHERE id = $12 AND program_id = $13`,
+            [
+              sponsor.sponsorName, sponsor.ctaText, sponsor.ctaLink, sponsor.boothText, sponsor.campaignTag, sponsor.tier,
+              sponsor.distributionPercentage, sponsor.displayOrder,
+              sponsor.newFlyer?.url || null, sponsor.newFlyer?.path || null, sponsor.newFlyer?.name || null,
+              sponsor.id, existing.id
+            ]
+          );
+        } else {
+          await client.query(
+            `INSERT INTO event_sponsors
+             (program_id, sponsor_name, flyer_url, flyer_storage_path, flyer_original_name, cta_text, cta_link, booth_text, campaign_tag, tier, distribution_percentage, display_order)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+            [
+              existing.id, sponsor.sponsorName, sponsor.newFlyer.url, sponsor.newFlyer.path, sponsor.newFlyer.name,
+              sponsor.ctaText, sponsor.ctaLink, sponsor.boothText, sponsor.campaignTag, sponsor.tier,
+              sponsor.distributionPercentage, sponsor.displayOrder
+            ]
+          );
+        }
+      }
+      // Removed sponsors are hidden, not deleted, so their click history stays in your reports.
+      const removedIds = existingSponsors.map((row) => String(row.id)).filter((id) => !keptIds.has(id));
+      if (removedIds.length > 0) {
+        await client.query(
+          'UPDATE event_sponsors SET is_active = false, updated_at = CURRENT_TIMESTAMP WHERE program_id = $1 AND id = ANY($2::uuid[])',
+          [existing.id, removedIds]
+        );
+      }
+      await client.query('COMMIT');
+    } catch (dbError) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw dbError;
+    } finally {
+      client.release();
+    }
+
+    // Saved: the replaced images are no longer used anywhere.
+    newUploads.length = 0;
+    oldPathsToDelete.forEach((path) => {
+      deleteEventFlyer(path).catch((deleteError) => console.error('Old image cleanup warning:', deleteError.message));
+    });
+
+    const [freshCheckins, sponsorRows] = await Promise.all([
+      countProgramCheckins(pool, updated.id, updated.total_scans),
+      getActiveSponsorRows(pool, updated.id)
+    ]);
+    return res.json({ program: mapProgramForEdit(updated, sponsorRows, freshCheckins) });
+  } catch (error) {
+    newUploads.forEach((path) => {
+      deleteEventFlyer(path).catch((deleteError) => console.error('Image cleanup warning:', deleteError.message));
+    });
+    if (error.code === 'SPONSOR_NOT_FOUND') {
+      return res.status(409).json({ error: 'A sponsor on this page was changed elsewhere. Refresh the page and try again.', field: 'sponsors' });
+    }
+    const described = describeCreateProgramError(error, 'We could not save your changes. Please try again.');
+    if (described.status >= 500) console.error('Update program error:', error);
+    const payload = { error: described.error };
+    if (described.field) payload.field = described.field;
+    return res.status(described.status).json(payload);
   }
 };
 
@@ -1108,12 +1664,12 @@ exports.getPrograms = async (req, res) => {
 exports.getDashboardBootstrap = async (req, res) => {
   try {
     const churchId = req.churchId;
-    const { startDate, endDate } = req.query;
+    const { startDate, endDate, today } = req.query;
 
     const [church, unreadCount, stats] = await Promise.all([
       getChurchProfile(churchId),
       getUnreadCountForChurch(churchId),
-      buildDashboardStatsPayload(churchId, startDate, endDate)
+      buildDashboardStatsPayload(churchId, startDate, endDate, today)
     ]);
 
     if (!church) {
@@ -1614,7 +2170,9 @@ exports.getPublicRsvpScanner = async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT p.id, p.title, p.date, p.start_time, p.end_time, p.is_active, c.church_name, COUNT(pe.id) AS linked_pre_events
+      `SELECT p.id, p.title, p.date, p.start_time, p.end_time, p.is_active, p.flyer_url, p.personalized_background_url,
+              c.church_name, COUNT(pe.id) AS linked_pre_events,
+              (SELECT COUNT(*) FROM attendees a WHERE a.program_id = p.id) AS checked_in_count
        FROM programs p
        JOIN churches c ON c.id = p.church_id
        LEFT JOIN pre_events pe ON pe.program_id = p.id
@@ -1636,7 +2194,9 @@ exports.getPublicRsvpScanner = async (req, res) => {
         startTime: program.start_time,
         endTime: program.end_time,
         isActive: program.is_active,
-        organizerName: program.church_name
+        organizerName: program.church_name,
+        flyerUrl: program.flyer_url || program.personalized_background_url || null,
+        checkedInCount: parseInt(program.checked_in_count, 10) || 0
       }
     });
   } catch (error) {

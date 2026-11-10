@@ -2,8 +2,32 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const pool = require('../config/database');
-const { generateOTP, sendOTPEmail, sendPasswordResetEmail } = require('../utils/emailService');
+const { notePasswordChanged } = require('../utils/sessionGuard');
+const {
+  generateOTP,
+  sendDeviceCodeEmail,
+  sendOTPEmail,
+  sendPasswordResetEmail,
+  sendSigninAlertEmail
+} = require('../utils/emailService');
 const { hashInviteToken } = require('../utils/waitlistInviteService');
+const { getPasswordProblem } = require('../utils/passwordPolicy');
+const { uploadEventFlyer, deleteEventFlyer } = require('../utils/supabaseStorage');
+const {
+  DEVICE_CODE_MAX_ATTEMPTS,
+  DEVICE_CODE_MAX_RESENDS,
+  DEVICE_CODE_RESEND_GAP_MS,
+  DEVICE_CODE_TTL_MS,
+  TRUSTED_DEVICE_DAYS,
+  describeDevice,
+  formatLagosTime,
+  hashDeviceCode,
+  hashDeviceId,
+  isDeviceCheckEnabled,
+  isMissingTableError,
+  maskEmail,
+  safeEqualHex
+} = require('../utils/deviceCheck');
 
 const OTP_MAX_ATTEMPTS = 5;
 const VALID_ORGANIZATION_TYPES = new Set([
@@ -72,6 +96,47 @@ const hasTooManyOtpAttempts = (church) => {
   return Number(church.otp_attempts || 0) >= OTP_MAX_ATTEMPTS;
 };
 
+const LOGIN_TOKEN_DAYS = 7;
+const REMEMBERED_LOGIN_TOKEN_DAYS = 30;
+
+const signLoginToken = (church, remember) => jwt.sign(
+  { churchId: church.id, email: church.email },
+  process.env.JWT_SECRET,
+  { expiresIn: `${remember ? REMEMBERED_LOGIN_TOKEN_DAYS : LOGIN_TOKEN_DAYS}d` }
+);
+
+// Saves a new password and records when it changed, which signs out other devices.
+// Falls back to the old update if the password_changed_at column has not been added yet.
+const savePassword = async (whereSql, params) => {
+  try {
+    const result = await pool.query(`UPDATE churches SET ${whereSql.set}, password_changed_at = NOW() WHERE ${whereSql.where} RETURNING id, password_changed_at`, params);
+    if (result.rows[0]) notePasswordChanged(result.rows[0].id, result.rows[0].password_changed_at);
+    return result.rows[0] || null;
+  } catch (error) {
+    if (error.code !== '42703') throw error;
+    const result = await pool.query(`UPDATE churches SET ${whereSql.set} WHERE ${whereSql.where} RETURNING id`, params);
+    return result.rows[0] || null;
+  }
+};
+
+const getFrontendBaseUrl = () => (process.env.FRONTEND_URL || 'https://ingather.app').replace(/\/+$/, '');
+
+const isTrueFlag = (value) => value === true || value === 'true' || value === 1 || value === '1';
+
+// Uploads the logo chosen at sign-up. Never blocks registration: on any
+// problem the workspace is still created and the logo can be added later.
+const saveSignupLogo = async (churchId, logoDataUrl) => {
+  if (!logoDataUrl || typeof logoDataUrl !== 'string') return null;
+  try {
+    const uploaded = await uploadEventFlyer({ churchId, dataUrl: logoDataUrl, folder: 'logo' });
+    await pool.query('UPDATE churches SET logo_url = $1 WHERE id = $2', [uploaded.flyerUrl, churchId]);
+    return uploaded.flyerUrl;
+  } catch (error) {
+    console.error('Sign-up logo upload failed:', error.message);
+    return null;
+  }
+};
+
 const incrementOtpAttempts = (email) => {
   return pool.query(
     'UPDATE churches SET otp_attempts = COALESCE(otp_attempts, 0) + 1 WHERE email = $1',
@@ -85,7 +150,12 @@ exports.register = async (req, res) => {
   let transactionOpen = false;
 
   try {
-    const { churchName, branchName, email, password, location, logoUrl, organizationType, inviteToken } = req.body;
+    const { churchName, branchName, email, password, location, logoUrl, logoDataUrl, organizationType, inviteToken } = req.body;
+
+    const passwordIssue = getPasswordProblem(password);
+    if (passwordIssue) {
+      return res.status(400).json({ error: passwordIssue });
+    }
     const normalizedEmail = normalizeEmail(email);
     const selectedOrganizationType = isValidOrganizationType(organizationType) ? organizationType : null;
     const inviteTokenHash = inviteToken ? hashInviteToken(inviteToken) : null;
@@ -133,6 +203,14 @@ exports.register = async (req, res) => {
     if (churchExists.rows.length > 0) {
       await client.query('ROLLBACK');
       transactionOpen = false;
+      if (!churchExists.rows[0].is_verified) {
+        // The workspace was created earlier but the email was never verified
+        return res.status(409).json({
+          error: 'This email already has a workspace waiting to be verified. Enter the code from your email, or press Resend code.',
+          requiresVerification: true,
+          email: churchExists.rows[0].email
+        });
+      }
       return res.status(400).json({ error: 'Account with this email already exists' });
     }
 
@@ -168,13 +246,29 @@ exports.register = async (req, res) => {
     await client.query('COMMIT');
     transactionOpen = false;
 
+    // From here the workspace exists, so nothing below may turn this into an error:
+    // a failed logo or email must not leave the person with a "server error" and a
+    // used-up invite. They can resend the code from the next screen.
+
+    // Save the sign-up logo, if one was chosen (never blocks registration)
+    await saveSignupLogo(result.rows[0].id, logoDataUrl);
+
     // Send OTP email
-    await sendOTPEmail(normalizedEmail, otp);
-    console.log(`OTP sent to ${normalizedEmail}`);
+    let emailSent = true;
+    try {
+      await sendOTPEmail(normalizedEmail, otp);
+      console.log(`OTP sent to ${normalizedEmail}`);
+    } catch (emailError) {
+      emailSent = false;
+      console.error('Register: workspace created but the verification email failed:', emailError.message);
+    }
 
     res.status(201).json({
-      message: 'Registration successful. Please verify your email.',
+      message: emailSent
+        ? 'Registration successful. Please verify your email.'
+        : 'Workspace created, but we could not send the code. Press Resend code.',
       requiresVerification: true,
+      emailSent,
       email: result.rows[0].email,
       organizationType: result.rows[0].organization_type || null
     });
@@ -198,8 +292,9 @@ exports.register = async (req, res) => {
 // Login Church
 exports.login = async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, deviceId, remember } = req.body;
     const normalizedEmail = normalizeEmail(email);
+    const rememberLogin = isTrueFlag(remember);
 
     // Check if church exists
     const result = await pool.query(
@@ -229,12 +324,25 @@ exports.login = async (req, res) => {
       });
     }
 
-    // Create JWT token
-    const token = jwt.sign(
-      { churchId: church.id, email: church.email },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
+    // New-device check (only when DEVICE_CHECK_ENABLED=true)
+    if (isDeviceCheckEnabled()) {
+      const challenge = await startDeviceChallenge({
+        church,
+        deviceId,
+        userAgent: req.get('user-agent'),
+        rememberLogin
+      });
+
+      if (challenge && challenge.error) {
+        return res.status(challenge.status || 500).json({ error: challenge.error });
+      }
+
+      if (challenge) {
+        return res.json(challenge);
+      }
+    }
+
+    const token = signLoginToken(church, rememberLogin);
 
     res.json({
       message: 'Login successful',
@@ -381,6 +489,11 @@ exports.resetPassword = async (req, res) => {
     const { email, otp, newPassword } = req.body;
     const normalizedEmail = normalizeEmail(email);
 
+    const passwordIssue = getPasswordProblem(newPassword);
+    if (passwordIssue) {
+      return res.status(400).json({ error: passwordIssue });
+    }
+
     const result = await pool.query(
       'SELECT * FROM churches WHERE email = $1',
       [normalizedEmail]
@@ -414,8 +527,9 @@ exports.resetPassword = async (req, res) => {
     const hashedPassword = await bcrypt.hash(newPassword, salt);
 
     // Update password and clear OTP
-    await pool.query(
-      'UPDATE churches SET password = $1, otp_code = NULL, otp_expires_at = NULL, otp_attempts = 0, otp_purpose = NULL WHERE email = $2',
+    // Also signs out every device that was signed in with the old password.
+    await savePassword(
+      { set: 'password = $1, otp_code = NULL, otp_expires_at = NULL, otp_attempts = 0, otp_purpose = NULL', where: 'email = $2' },
       [hashedPassword, normalizedEmail]
     );
 
@@ -445,14 +559,38 @@ exports.getCurrentChurch = async (req, res) => {
   }
 };
 // Update church information
+const cleanProfileText = (value, max) => String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, max);
+
+// Only remove logo files this workspace owns in our own storage bucket.
+const removeStoredLogo = (churchId, logoUrl) => {
+  const match = /\/storage\/v1\/object\/public\/[^/]+\/(church-(\d+)\/logo\/[^?#]+)$/.exec(String(logoUrl || ''));
+  if (!match || Number(match[2]) !== Number(churchId)) return;
+  deleteEventFlyer(decodeURIComponent(match[1])).catch((error) => {
+    console.error('Old logo cleanup warning:', error.message);
+  });
+};
+
 exports.updateChurch = async (req, res) => {
   try {
-    const { churchName, branchName, location, logoUrl } = req.body;
     const churchId = req.churchId;
+    const churchName = cleanProfileText(req.body.churchName, 120);
+    const branchName = cleanProfileText(req.body.branchName, 120);
+    const location = cleanProfileText(req.body.location, 200);
+    const { logoUrl } = req.body;
 
-    // If logoUrl is provided, update it too; otherwise keep existing
+    const fieldErrors = {};
+    if (!churchName) fieldErrors.churchName = 'Add your organisation name.';
+    if (!branchName) fieldErrors.branchName = 'Add a team, branch or location.';
+    if (Object.keys(fieldErrors).length > 0) {
+      return res.status(400).json({ error: 'Fill in the fields marked in red to save.', fieldErrors });
+    }
+
+    // Logos now go through PUT /auth/logo. A logoUrl here is only accepted as a
+    // web link or null so large images are never stored in the database.
+    const acceptLogo = logoUrl === null || (typeof logoUrl === 'string' && /^https:\/\//i.test(logoUrl));
+
     let result;
-    if (logoUrl !== undefined) {
+    if (acceptLogo) {
       result = await pool.query(
         `UPDATE churches 
          SET church_name = $1, branch_name = $2, location = $3, logo_url = $4, updated_at = CURRENT_TIMESTAMP
@@ -481,6 +619,67 @@ exports.updateChurch = async (req, res) => {
   } catch (error) {
     console.error('Update church error:', error);
     res.status(500).json({ error: 'Server error updating church information' });
+  }
+};
+
+// Upload or replace the workspace logo (already resized in the browser).
+exports.updateLogo = async (req, res) => {
+  try {
+    const churchId = req.churchId;
+    const { logoDataUrl } = req.body;
+    if (typeof logoDataUrl !== 'string' || !/^data:image\/(png|jpe?g|webp);base64,/i.test(logoDataUrl)) {
+      return res.status(400).json({ error: 'Use a PNG, JPG or WebP image.' });
+    }
+
+    const current = await pool.query('SELECT logo_url FROM churches WHERE id = $1', [churchId]);
+    if (current.rows.length === 0) {
+      return res.status(404).json({ error: 'Church not found' });
+    }
+
+    let uploaded;
+    try {
+      uploaded = await uploadEventFlyer({ churchId, dataUrl: logoDataUrl, folder: 'logo' });
+    } catch (uploadError) {
+      console.error('Logo upload failed:', uploadError.message);
+      const tooLarge = /too large/i.test(uploadError.message);
+      return res.status(tooLarge ? 413 : 400).json({
+        error: tooLarge ? 'That file is too big. Use an image under 5 MB.' : 'We could not upload that image. Try a PNG or JPG.'
+      });
+    }
+
+    const result = await pool.query(
+      `UPDATE churches SET logo_url = $1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2
+       RETURNING id, church_name, branch_name, email, location, logo_url, organization_type`,
+      [uploaded.flyerUrl, churchId]
+    );
+    removeStoredLogo(churchId, current.rows[0].logo_url);
+
+    return res.json({ message: 'Logo updated', church: mapChurchProfile(result.rows[0]) });
+  } catch (error) {
+    console.error('Update logo error:', error);
+    return res.status(500).json({ error: 'Server error updating logo' });
+  }
+};
+
+exports.removeLogo = async (req, res) => {
+  try {
+    const churchId = req.churchId;
+    const current = await pool.query('SELECT logo_url FROM churches WHERE id = $1', [churchId]);
+    if (current.rows.length === 0) {
+      return res.status(404).json({ error: 'Church not found' });
+    }
+    const result = await pool.query(
+      `UPDATE churches SET logo_url = NULL, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1
+       RETURNING id, church_name, branch_name, email, location, logo_url, organization_type`,
+      [churchId]
+    );
+    removeStoredLogo(churchId, current.rows[0].logo_url);
+    return res.json({ message: 'Logo removed', church: mapChurchProfile(result.rows[0]) });
+  } catch (error) {
+    console.error('Remove logo error:', error);
+    return res.status(500).json({ error: 'Server error removing logo' });
   }
 };
 
@@ -525,8 +724,9 @@ exports.changePassword = async (req, res) => {
       return res.status(400).json({ error: 'Current password and new password are required' });
     }
 
-    if (newPassword.length < 6) {
-      return res.status(400).json({ error: 'New password must be at least 6 characters' });
+    const passwordIssue = getPasswordProblem(newPassword);
+    if (passwordIssue) {
+      return res.status(400).json({ error: passwordIssue });
     }
 
     // Get church
@@ -540,22 +740,251 @@ exports.changePassword = async (req, res) => {
     // Verify current password
     const isMatch = await bcrypt.compare(currentPassword, church.password);
     if (!isMatch) {
-      return res.status(400).json({ error: 'Current password is incorrect' });
+      return res.status(400).json({
+        error: 'That password is not right. Try again or reset it from the sign-in page.',
+        code: 'WRONG_CURRENT_PASSWORD'
+      });
+    }
+
+    if (await bcrypt.compare(newPassword, church.password)) {
+      return res.status(400).json({ error: 'Pick a new password that is different from your current one.', code: 'SAME_PASSWORD' });
     }
 
     // Hash new password
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(newPassword, salt);
 
-    // Update password
-    await pool.query(
-      'UPDATE churches SET password = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-      [hashedPassword, churchId]
-    );
+    // Update password. Other devices are signed out; this one gets a fresh sign-in so it stays in.
+    await savePassword({ set: 'password = $1, updated_at = CURRENT_TIMESTAMP', where: 'id = $2' }, [hashedPassword, churchId]);
+    const remembered = Boolean(req.tokenExp) && (req.tokenExp * 1000 - Date.now()) > (LOGIN_TOKEN_DAYS + 1) * 24 * 60 * 60 * 1000;
 
-    res.json({ message: 'Password changed successfully' });
+    res.json({ message: 'Password changed successfully', token: signLoginToken(church, remembered), otherDevicesSignedOut: true });
   } catch (error) {
     console.error('Change password error:', error);
     res.status(500).json({ error: 'Server error changing password' });
+  }
+};
+
+
+/* ------------------------------------------------------------------
+ * New-device check
+ * ------------------------------------------------------------------ */
+
+// Returns null when the device is already trusted (or the check cannot run
+// because its tables are missing), an object to send back when a code was
+// emailed, or { error, status } when the code could not be sent.
+const startDeviceChallenge = async ({ church, deviceId, userAgent, rememberLogin }) => {
+  const deviceHash = hashDeviceId(deviceId);
+  const deviceLabel = describeDevice(userAgent);
+
+  try {
+    const trusted = await pool.query(
+      `UPDATE trusted_devices
+       SET last_used_at = NOW()
+       WHERE church_id = $1 AND device_hash = $2 AND expires_at > NOW()
+       RETURNING id`,
+      [church.id, deviceHash]
+    );
+
+    if (trusted.rows.length > 0) {
+      return null;
+    }
+
+    const challengeResult = await pool.query(
+      `INSERT INTO device_login_challenges
+         (church_id, device_hash, device_label, code_hash, remember_login, expires_at)
+       VALUES ($1, $2, $3, 'pending', $4, NOW() + INTERVAL '10 minutes')
+       RETURNING id`,
+      [church.id, deviceHash, deviceLabel, Boolean(rememberLogin)]
+    );
+    const challengeId = challengeResult.rows[0].id;
+    const code = generateOTP();
+
+    await pool.query(
+      'UPDATE device_login_challenges SET code_hash = $1 WHERE id = $2',
+      [hashDeviceCode(challengeId, code), challengeId]
+    );
+
+    const emailResult = await sendDeviceCodeEmail({
+      email: church.email,
+      code,
+      deviceLabel,
+      time: formatLagosTime()
+    });
+
+    if (!emailResult.sent) {
+      await pool.query('UPDATE device_login_challenges SET consumed_at = NOW() WHERE id = $1', [challengeId]);
+      return { status: 503, error: "We couldn't send your sign-in code. Please try again in a minute." };
+    }
+
+    return {
+      requiresDeviceVerification: true,
+      challengeId,
+      maskedEmail: maskEmail(church.email),
+      deviceLabel,
+      expiresInSeconds: Math.round(DEVICE_CODE_TTL_MS / 1000),
+      resendInSeconds: Math.round(DEVICE_CODE_RESEND_GAP_MS / 1000)
+    };
+  } catch (error) {
+    if (isMissingTableError(error)) {
+      console.warn('Device check is on but its tables are missing. Run the device check SQL script. Logging in without the check.');
+      return null;
+    }
+    throw error;
+  }
+};
+
+const loadChallenge = async (challengeId) => {
+  if (!/^[0-9a-f-]{36}$/i.test(String(challengeId || ''))) return null;
+  const result = await pool.query(
+    `SELECT dlc.*, c.email, c.church_name, c.is_verified,
+            (dlc.expires_at <= NOW()) AS is_expired,
+            EXTRACT(EPOCH FROM (NOW() - dlc.last_sent_at)) AS seconds_since_send
+     FROM device_login_challenges dlc
+     JOIN churches c ON c.id = dlc.church_id
+     WHERE dlc.id = $1`,
+    [challengeId]
+  );
+  return result.rows[0] || null;
+};
+
+// Confirm a new device with the emailed code
+exports.verifyDevice = async (req, res) => {
+  try {
+    const { challengeId, code, deviceId, rememberDevice } = req.body;
+    const challenge = await loadChallenge(challengeId);
+
+    if (!challenge || challenge.consumed_at) {
+      return res.status(400).json({ error: 'This sign-in has ended. Please log in again.', restart: true });
+    }
+
+    if (!safeEqualHex(challenge.device_hash, hashDeviceId(deviceId))) {
+      return res.status(400).json({ error: 'Please finish signing in on the device that asked for the code.', restart: true });
+    }
+
+    if (challenge.is_expired) {
+      return res.status(410).json({ error: 'This code has expired. Send a new one to keep going.', expired: true });
+    }
+
+    if (Number(challenge.attempts) >= DEVICE_CODE_MAX_ATTEMPTS) {
+      return res.status(429).json({ error: 'Too many wrong codes. Send a new one to keep going.', expired: true });
+    }
+
+    if (!safeEqualHex(challenge.code_hash, hashDeviceCode(challenge.id, code))) {
+      const updated = await pool.query(
+        'UPDATE device_login_challenges SET attempts = attempts + 1 WHERE id = $1 RETURNING attempts',
+        [challenge.id]
+      );
+      const attemptsLeft = Math.max(0, DEVICE_CODE_MAX_ATTEMPTS - Number(updated.rows[0]?.attempts || 0));
+      return res.status(400).json({
+        error: attemptsLeft > 0
+          ? `That code isn't right. You have ${attemptsLeft} ${attemptsLeft === 1 ? 'try' : 'tries'} left.`
+          : 'Too many wrong codes. Send a new one to keep going.',
+        attemptsLeft,
+        expired: attemptsLeft === 0
+      });
+    }
+
+    const consumed = await pool.query(
+      'UPDATE device_login_challenges SET consumed_at = NOW() WHERE id = $1 AND consumed_at IS NULL RETURNING id',
+      [challenge.id]
+    );
+    if (consumed.rows.length === 0) {
+      return res.status(400).json({ error: 'This sign-in has ended. Please log in again.', restart: true });
+    }
+
+    if (isTrueFlag(rememberDevice)) {
+      await pool.query(
+        `INSERT INTO trusted_devices (church_id, device_hash, device_label, expires_at)
+         VALUES ($1, $2, $3, NOW() + ($4 || ' days')::interval)
+         ON CONFLICT (church_id, device_hash)
+         DO UPDATE SET device_label = EXCLUDED.device_label, last_used_at = NOW(), expires_at = EXCLUDED.expires_at`,
+        [challenge.church_id, challenge.device_hash, challenge.device_label, String(TRUSTED_DEVICE_DAYS)]
+      );
+    }
+
+    const churchResult = await pool.query('SELECT * FROM churches WHERE id = $1', [challenge.church_id]);
+    const church = churchResult.rows[0];
+    if (!church) {
+      return res.status(404).json({ error: 'Account not found' });
+    }
+
+    const token = signLoginToken(church, challenge.remember_login);
+
+    // Security alert to the account email. A failure here never blocks sign-in.
+    sendSigninAlertEmail({
+      email: church.email,
+      workspaceName: church.church_name,
+      deviceLabel: challenge.device_label,
+      time: formatLagosTime(),
+      resetLink: `${getFrontendBaseUrl()}/forgot-password`
+    }).catch((error) => console.error('Sign-in alert email error:', error.message));
+
+    return res.json({
+      message: 'Login successful',
+      token,
+      church: mapChurchProfile(church)
+    });
+  } catch (error) {
+    console.error('Verify device error:', error);
+    return res.status(500).json({ error: 'Server error while checking your code' });
+  }
+};
+
+// Send a fresh code for the same sign-in
+exports.resendDeviceCode = async (req, res) => {
+  try {
+    const { challengeId, deviceId } = req.body;
+    const challenge = await loadChallenge(challengeId);
+
+    if (!challenge || challenge.consumed_at) {
+      return res.status(400).json({ error: 'This sign-in has ended. Please log in again.', restart: true });
+    }
+
+    if (!safeEqualHex(challenge.device_hash, hashDeviceId(deviceId))) {
+      return res.status(400).json({ error: 'Please finish signing in on the device that asked for the code.', restart: true });
+    }
+
+    // Time maths is done by the database, so server and database time zones never disagree
+    const sinceLastSend = Number(challenge.seconds_since_send || 0) * 1000;
+    if (sinceLastSend < DEVICE_CODE_RESEND_GAP_MS) {
+      return res.status(429).json({
+        error: 'Please wait a moment before asking for another code.',
+        resendInSeconds: Math.ceil((DEVICE_CODE_RESEND_GAP_MS - sinceLastSend) / 1000)
+      });
+    }
+
+    if (Number(challenge.resend_count) >= DEVICE_CODE_MAX_RESENDS) {
+      return res.status(429).json({ error: 'Too many codes sent. Please log in again.', restart: true });
+    }
+
+    const code = generateOTP();
+    await pool.query(
+      `UPDATE device_login_challenges
+       SET code_hash = $1, attempts = 0, resend_count = resend_count + 1,
+           last_sent_at = NOW(), expires_at = NOW() + INTERVAL '10 minutes'
+       WHERE id = $2`,
+      [hashDeviceCode(challenge.id, code), challenge.id]
+    );
+
+    const emailResult = await sendDeviceCodeEmail({
+      email: challenge.email,
+      code,
+      deviceLabel: challenge.device_label,
+      time: formatLagosTime()
+    });
+
+    if (!emailResult.sent) {
+      return res.status(503).json({ error: "We couldn't send a new code. Please try again in a minute." });
+    }
+
+    return res.json({
+      message: 'A new code is on its way.',
+      expiresInSeconds: Math.round(DEVICE_CODE_TTL_MS / 1000),
+      resendInSeconds: Math.round(DEVICE_CODE_RESEND_GAP_MS / 1000)
+    });
+  } catch (error) {
+    console.error('Resend device code error:', error);
+    return res.status(500).json({ error: 'Server error while sending a new code' });
   }
 };
